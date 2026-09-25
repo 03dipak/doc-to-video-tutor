@@ -10,11 +10,17 @@ requires-python = ">=3.12"
  dependencies = [
      "python-dotenv>=1.0",
      "requests>=2.31",
-     "edge-tts>=6.1",
+     # Pinned, not a floor: edge-tts is an unofficial wrapper around a consumer
+    # endpoint, so a minor release can change the response shape without notice.
+    # The known-good version is exercised by `studio tts-check` in CI.
+    "edge-tts==7.2.8",
      "moviepy>=1.0.3",
      "python-pptx>=0.6.23",
      "Pillow>=10.0",
      "pydantic>=2.0",
+    # Syntax colouring for the code panel. Pure-Python, BSD-licensed, and it only
+    # recolours text the model already produced - it cannot invent content.
+    "pygments>=2.19",
  ]
 
 [project.scripts]
@@ -62,6 +68,7 @@ build-backend = "uv_build"
 dev = [
     "mypy>=2.3.1",
     "pytest>=8.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.7",
 ]
 

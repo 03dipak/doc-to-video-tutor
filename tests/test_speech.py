@@ -378,3 +378,175 @@ def test_voices_have_spoken_bullet_leads() -> None:
         assert len(voice.bullet_leads) >= 3
         for lead in voice.bullet_leads:
             assert len(lead.split()) >= 3
+
+
+def test_json_payload_variants_are_both_valid_json() -> None:
+    import json as _json
+
+    scene = {"json_snippet": (
+        '{\n  "schema_version": 1,\n  "baseline_id": "v1.2.0",\n'
+        '  "path": "eval/baselines/v1.2.0.json"\n}')}
+    candidates = S._json_payload_candidates(scene)
+    assert len(candidates) == 2
+    assert len(candidates[0]) == 5
+    assert len(candidates[1]) == 1
+    for variant in candidates:
+        _json.loads("\n".join(variant))
+
+
+def test_json_payload_candidates_empty_without_snippet() -> None:
+    assert S._json_payload_candidates({}) == []
+    assert S._json_payload_candidates({"json_snippet": "  "}) == []
+
+
+def test_module_labels_cover_the_whole_scene_range() -> None:
+    for index, word in ((1, "one"), (6, "six"), (7, "seven"), (9, "nine"),
+                        (12, "twelve")):
+        for voice in (S._MHE_VOICE, S._ENGLISH_VOICE):
+            out = S.speech_expand(f"M{index}", voice.pronunciation_rules)
+            assert out == f"module {word}", (index, voice.name, out)
+    # Word-boundary matching must keep m1 from firing inside a longer token.
+    assert S.speech_expand("rasm1", S._MHE_VOICE.pronunciation_rules) == "rasm1"
+
+
+def test_clip_title_trims_on_a_word_boundary() -> None:
+    assert S.clip_title("Short title") == "Short title"
+    trimmed = S.clip_title(
+        "The 11-step precedence — structure before values, FAIL over REVIEW")
+    assert trimmed == "The 11-step precedence — structure before"
+    assert not trimmed.endswith("va")
+    assert len(trimmed) <= 44
+
+
+def test_deck_text_always_declares_an_explicit_font_face() -> None:
+    """Regression: the deck silently rendered in the theme font (Calibri).
+
+    Neither text helper set `font.name`, so 132 of 171 paragraphs inherited the
+    theme's minor font instead of Arial, and the one code panel in the
+    enrichment blocks rendered proportional instead of Courier New. Only
+    paragraphs with visible text matter: the empty placeholder paragraph inside
+    an autoshape carries no glyphs.
+    """
+    import re
+    import zipfile
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    plan = {
+        "title": "Regression gates",
+        "opening": "A deterministic gate",
+        "takeaways": ["Exit codes are the verdict language"],
+        "scenes": [{
+            "section": "What Is This",
+            "title": "Metric registry",
+            "narration": "The registry types every metric so verdicts stay mechanical.",
+            "bullets": ["Store direction, kind, tolerance, and unit."],
+            "design_decision": "Types make the verdict mechanical.",
+            "code_snippet": "compare.py --baseline active.json",
+            "code_context": "Run the comparison against the pointer.",
+            "visual_diagram": "[Metric] ---> [Verdict]",
+            "status_badges": [
+                {"code": "0", "label": "PASS", "state": "PASS"},
+                {"code": "1", "label": "FAIL", "state": "FAIL"},
+            ],
+            "json_snippet": '{\n  "schema_version": 1,\n  "path": "b.json"\n}',
+        }],
+    }
+    with TemporaryDirectory() as tmp:
+        out = Path(tmp) / "deck.pptx"
+        build_pptx(plan, out)
+        faces: set[str] = set()
+        text_without_face = 0
+        with zipfile.ZipFile(out) as archive:
+            for name in archive.namelist():
+                if not re.match(r"ppt/slides/slide\d+\.xml$", name):
+                    continue
+                xml = archive.read(name).decode("utf-8")
+                faces.update(re.findall(r'<a:latin typeface="([^"]+)"', xml))
+                for para in re.findall(r"<a:p>.*?</a:p>", xml, re.S):
+                    body = "".join(re.findall(r"<a:t>(.*?)</a:t>", para, re.S))
+                    if body.strip() and "<a:latin " not in para:
+                        text_without_face += 1
+    assert text_without_face == 0
+    assert faces <= {"Arial", "Courier New"}, faces
+    assert {"Arial", "Courier New"} <= faces
+
+
+def _timings(words: list[tuple[str, float]]) -> list[dict]:
+    return [{"text": text, "start": start, "duration": 0.3}
+            for text, start in words]
+
+
+def test_bullet_start_times_match_spoken_words() -> None:
+    from doc_to_video_tutor.studio.video import _bullet_start_times
+
+    timings = _timings([("frozen", 1.0), ("golden", 1.3), ("report", 1.6),
+                        ("store", 1.9), ("delta", 5.0), ("nikalte", 5.3)])
+    # The anchor is the bullet's longest token, so "report" wins over "frozen",
+    # and "nikalte" wins over "delta".
+    starts = _bullet_start_times(["Frozen golden report", "delta nikalte hain"],
+                                 timings)
+    assert starts == [1.0, 5.3]
+
+
+def test_bullet_start_times_report_unmatched_bullets() -> None:
+    from doc_to_video_tutor.studio.video import _bullet_start_times
+
+    timings = _timings([("alpha", 1.0), ("beta", 1.4)])
+    assert _bullet_start_times(["nothing spoken here"], timings) == [-1.0]
+    assert _bullet_start_times(["a b c"], timings) == [-1.0]
+    # No timings at all yields no result rather than a bogus time.
+    assert _bullet_start_times(["alpha beta"], []) == []
+    assert _bullet_start_times([], timings) == []
+
+
+def test_variant_durations_follow_speech_and_conserve_duration() -> None:
+    from doc_to_video_tutor.studio.video import _variant_durations
+
+    timings = _timings([("snapshot", 2.0), ("compare", 6.0), ("tolerance", 10.0)])
+    parts = _variant_durations(20.0, 4,
+                              ["frozen snapshot", "compare the metrics",
+                               "tolerance gate"], timings)
+    assert len(parts) == 4
+    assert abs(sum(parts) - 20.0) < 1e-6
+    # The first reveal waits for the first bullet, not a fixed 15%.
+    assert abs(parts[0] - 2.0) < 1e-6
+    assert all(p > 0 for p in parts)
+
+
+def test_variant_durations_fall_back_without_usable_timings() -> None:
+    from doc_to_video_tutor.studio.video import _variant_durations
+
+    even = _variant_durations(20.0, 4, ["a b", "c d", "e f"], [])
+    assert len(even) == 4
+    assert abs(sum(even) - 20.0) < 1e-6
+    # Unmatched bullets, no bullets, and too few bullets all degrade identically.
+    timings = _timings([("zzz", 1.0)])
+    assert _variant_durations(20.0, 4, ["qqq www"], timings) == even
+    assert _variant_durations(20.0, 4, None, timings) == even
+    assert _variant_durations(20.0, 4, ["a b"], timings) == even
+    assert _variant_durations(20.0, 1, ["a b"], timings) == [20.0]
+
+
+def test_code_line_colors_preserve_text_and_never_invent() -> None:
+    """Pygments may only recolour existing characters, never add or drop any."""
+    from doc_to_video_tutor.studio.slides import _code_line_colors
+
+    lines = ["def compare(base):", "    return 1  # done"]
+    for hint in ("compare.py", "", "unknown.zzz", "noextension"):
+        rebuilt = ["".join(token for token, _ in parts)
+                   for parts in _code_line_colors(lines, hint)]
+        assert rebuilt == lines, hint
+
+
+def test_code_line_colors_use_the_extension_and_degrade_flat() -> None:
+    from doc_to_video_tutor.studio.slides import _code_line_colors
+
+    coloured = _code_line_colors(["def compare(base):"], "compare.py")
+    assert len(coloured[0]) > 1
+    assert any(colour != (140, 200, 255) for _, colour in coloured[0])
+    # A hint with no recognisable extension degrades to one flat run.
+    assert _code_line_colors(["def compare(base):"], "noextension") == [
+        [("def compare(base):", (140, 200, 255))]]

@@ -679,3 +679,107 @@ def test_concept_groups_cover_every_source_concept() -> None:
         assert c in flat  # no concept silently dropped
     assert groups[0] == "Concept 01 name"  # 1:1 at 12-concept ceiling
     assert len(S._concept_groups(concepts[:6])) == 6  # 1:1 when within range
+
+
+def test_concrete_values_population_is_source_grounded() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_concrete_values
+
+    pointer = {
+        "title": "Canonical pointer", "source_chunk": (
+            "active.json is a tiny pointer {schema_version, baseline_id, path} "
+            "that names which committed baseline is current."),
+    }
+    assert _populate_concrete_values(pointer, str(pointer["source_chunk"])) == 1
+    assert "schema_version" in pointer["json_snippet"]
+    assert "baseline_id" in pointer["json_snippet"]
+    # Re-running must not rewrite what is already there.
+    before = pointer["json_snippet"]
+    assert _populate_concrete_values(pointer, str(pointer["source_chunk"])) == 0
+    assert pointer["json_snippet"] == before
+
+
+def test_value_table_never_renders_exit_codes_as_thresholds() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_concrete_values
+
+    exit_codes = {
+        "title": "Structural error classes",
+        "source_chunk": ("Plain words: exit code 0 PASS, 1 FAIL, 2 REVIEW are "
+                         "verdicts, while 3 and 4 are configuration errors."),
+    }
+    _populate_concrete_values(exit_codes, str(exit_codes["source_chunk"]))
+    assert not exit_codes.get("value_table")
+
+
+def test_value_table_requires_two_boundary_rows() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_concrete_values
+
+    single = {"title": "Tolerance", "source_chunk":
+              "the inclusive band is 0.97 PASS / 0.96 FAIL for this metric."}
+    _populate_concrete_values(single, str(single["source_chunk"]))
+    assert not single.get("value_table")
+
+    pair = {"title": "Tolerance", "source_chunk": (
+        "boundary PASS 0.97 with FAIL 0.96 verified, and relative 120ms PASS "
+        "with 121ms REVIEW recorded.")}
+    assert _populate_concrete_values(pair, str(pair["source_chunk"])) == 1
+    assert len(pair["value_table"]) == 2
+    assert all("|" in row for row in pair["value_table"])
+
+
+def test_status_badges_populated_from_real_exit_code_map() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_status_badges
+
+    scene = {"title": "Structural error classes", "source_chunk": (
+        "exit code 0 PASS, 1 FAIL, 2 REVIEW are verdicts. 3 = evaluation/input "
+        "error and 4 = config/baseline error for a broken pointer.")}
+    assert _populate_status_badges(scene, str(scene["source_chunk"])) == 1
+    badges = scene["status_badges"]
+    assert [b["code"] for b in badges] == ["0", "1", "2", "3", "4"]
+    assert [b["state"] for b in badges] == ["PASS", "FAIL", "REVIEW",
+                                            "ERROR", "ERROR"]
+    assert badges[3]["label"] == "EVAL ERR"
+    assert badges[4]["label"] == "CONFIG ERR"
+    # Idempotent: an existing row is never rewritten.
+    assert _populate_status_badges(scene, str(scene["source_chunk"])) == 0
+
+
+def test_status_badges_absent_without_the_verdict_triple() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_status_badges
+
+    partial = {"title": "Tolerance", "source_chunk":
+               "The gate reports 0 PASS or 1 FAIL on a metric boundary."}
+    assert _populate_status_badges(partial, str(partial["source_chunk"])) == 0
+    assert not partial.get("status_badges")
+
+    unrelated = {"title": "Baseline", "source_chunk":
+                 "A baseline stores a known-good snapshot of every metric."}
+    assert _populate_status_badges(unrelated, str(unrelated["source_chunk"])) == 0
+    assert not unrelated.get("status_badges")
+
+
+def test_status_badges_error_label_falls_back_without_keywords() -> None:
+    from doc_to_video_tutor.studio.plan import _populate_status_badges
+
+    scene = {"title": "Codes", "source_chunk": (
+        "0 PASS, 1 FAIL, 2 REVIEW are verdicts. 3 = runtime breakdown of the "
+        "harness itself.")}
+    assert _populate_status_badges(scene, str(scene["source_chunk"])) == 1
+    labels = {b["code"]: b["label"] for b in scene["status_badges"]}
+    assert labels["3"] == "ERROR"
+
+
+def test_scene_title_repair_targets_only_truncated_titles() -> None:
+    from doc_to_video_tutor.studio.plan import _normalize_scene_titles
+
+    truncated = "The 11-step precedence — structure before va"
+    plan = {"scenes": [
+        {"title": truncated,
+         "topic": "The 11-step precedence — structure before values, FAIL over REVIEW"},
+        {"title": "M4 Tolerance units", "topic": "M4 Tolerance units"},
+    ]}
+    assert _normalize_scene_titles(plan) == 1
+    repaired = plan["scenes"][0]["title"]
+    assert repaired == "The 11-step precedence — structure before"
+    assert not repaired.endswith("va")
+    # A title that was never truncated keeps the model's wording and label.
+    assert plan["scenes"][1]["title"] == "M4 Tolerance units"

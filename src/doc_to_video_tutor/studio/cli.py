@@ -67,6 +67,70 @@ def narration_under_run_warning(words: int, target_minutes: float) -> str | None
             f"narration")
 
 
+def _tts_health_check(args) -> int:
+    """Probe the TTS provider and assert it still behaves as the pipeline assumes.
+
+    `edge-tts` wraps a consumer reading service rather than a published API, so
+    it can change shape without a deprecation notice. This probe fails loudly
+    and early instead of letting a silent breakage surface as a production
+    outage: it checks that a fixed phrase yields audio of a plausible duration
+    and that per-word boundary events are still returned, which the reveal
+    alignment in §19.5 depends on.
+    """
+    import tempfile
+    import time as _time
+    from pathlib import Path as _Path
+
+    from .video import _scene_audio
+    from .voice import _make_voice as _mk
+
+    profile = _mk(getattr(args, "narr_voice", None))
+    voice, rate, pitch, volume = _clip_probe_voice(profile, args.voice)
+    phrase = "Regression gate baseline compare tolerance check."
+    out_dir = _Path(args.out_dir) if args.out_dir else _Path(tempfile.mkdtemp())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / "tts_check.mp3"
+    started = _time.monotonic()
+    try:
+        words = _asyncio_run(_scene_audio(phrase, target, voice, rate, pitch,
+                                          volume))
+    except Exception as exc:  # provider transport error
+        print(f"  TTS probe : FAIL — provider call raised "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+    elapsed = _time.monotonic() - started
+    size = target.stat().st_size if target.exists() else 0
+    print(f"  provider  : edge-tts voice={voice} rate={rate}")
+    print(f"  audio     : {size} bytes in {elapsed:.1f}s -> {target}")
+    print(f"  word sync : {len(words)} boundary events")
+    problems = []
+    if size < 1024:
+        problems.append("audio is effectively empty")
+    if not words:
+        problems.append("no WordBoundary events — reveal sync would degrade "
+                        "to an even split")
+    if words and words[-1]["start"] > 60:
+        problems.append("last word offset beyond 60s — timing looks wrong")
+    for problem in problems:
+        print(f"  [FAIL] {problem}")
+    if not problems:
+        print("  TTS probe : PASS")
+    return 1 if problems else 0
+
+
+def _asyncio_run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _clip_probe_voice(profile, override):
+    voice = override or profile.tts_voice
+    if not voice:
+        raise SystemExit("tts-check: the voice profile has no concrete tts_voice")
+    return voice, profile.rate, profile.pitch, profile.volume
+
+
 def _write_tts_artifacts(out_base: Path, script: dict, args) -> None:
     """Apply CLI overrides, persist tts_script.json + script.txt, print the audit."""
     if args.rate:
@@ -124,7 +188,8 @@ def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
     argv = list(argv)
-    if argv and argv[0] not in ("build", "review", "render", "verify") \
+    if argv and argv[0] not in ("build", "review", "render", "verify",
+                               "tts-check") \
             and argv[0] not in ("-h", "--help"):
         argv = ["build", *argv]
 
@@ -154,6 +219,15 @@ def main(argv: list[str] | None = None) -> None:
     review_p.add_argument("plan_json", nargs="+", help="path(s) to *.plan.json")
     review_p.add_argument("--topics", nargs="+", default=None,
                           help="override topic reference list")
+
+    tts_p = sub.add_parser(
+        "tts-check",
+        help="TTS provider health probe: synthesise a fixed phrase, assert a "
+             "plausible duration and that word boundaries are returned")
+    tts_p.add_argument("--voice", default=None,
+                       help="engine voice override (default: profile/env)")
+    tts_p.add_argument("--out-dir", default=None,
+                       help="keep the probe clip(s) in this directory")
 
     verify_p = sub.add_parser(
         "verify",
@@ -188,6 +262,8 @@ def main(argv: list[str] | None = None) -> None:
                           help="extra hold seconds on the last slide (default 6.0)")
 
     args = parser.parse_args(argv)
+    if args.cmd == "tts-check":
+        raise SystemExit(_tts_health_check(args))
     if args.cmd == "review":
         topics = args.topics or None
         code = 0

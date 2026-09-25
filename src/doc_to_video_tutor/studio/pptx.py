@@ -8,8 +8,15 @@ from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches
 
-from .config import _VIDEO_BODY_MAX, ACCENT, BRAND_FOOTER, GOLD, GREEN, MUTED
-from .slides import _parse_diagram, _scene_pages, _with_overflow, _wrap
+from .config import _VIDEO_BODY_MAX, ACCENT, BRAND_FOOTER, GOLD, GREEN, MUTED, RED
+from .slides import (
+    _json_payload_candidates,
+    _parse_diagram,
+    _scene_pages,
+    _with_overflow,
+    _wrap,
+)
+from .text import clip_title
 
 
 def _ppt_set_bg(slide, color=(18, 24, 38)):
@@ -38,13 +45,20 @@ def _ppt_bullet(paragraph, char="•"):
     pPr.insert_element_before(buFont, *succ)
     succ2 = ["a:buBlip", "a:tabLst", "a:defRPr", "a:extLst"]
     pPr.insert_element_before(buChar, *succ2)
-def _ppt_para(tf, text: str, size, color, bullet: bool = False, bold: bool = False):
-    """Add a wrapped paragraph to a text frame with styling."""
+def _ppt_para(tf, text: str, size, color, bullet: bool = False, bold: bool = False,
+              font_name: str = "Arial"):
+    """Add a wrapped paragraph to a text frame with styling.
+
+    The font name is set explicitly on every run: without it the paragraph
+    inherits the theme's minor font, so the deck silently rendered in Calibri
+    instead of the Arial the template specifies.
+    """
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
 
     p = tf.add_paragraph()
     p.text = text
+    p.font.name = font_name
     p.font.size = Pt(size)
     p.font.bold = bold
     p.font.color.rgb = RGBColor(*color)
@@ -53,7 +67,7 @@ def _ppt_para(tf, text: str, size, color, bullet: bool = False, bold: bool = Fal
         _ppt_bullet(p)
     return p
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
-                 bold=False, wrap=True):
+                 bold=False, wrap=True, font_name: str = "Arial"):
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
 
@@ -63,6 +77,7 @@ def _ppt_textbox(slide, left, top, width, height, text, size, color,
     tf.margin_left = Inches(0.1)
     p = tf.paragraphs[0]
     p.text = text
+    p.font.name = font_name
     p.font.size = Pt(size)
     p.font.bold = bold
     p.font.color.rgb = RGBColor(*color)
@@ -143,7 +158,8 @@ def _ppt_slide_chrome(slide, section: str, title: str, counter: str,
                   section_color, bold=True)
     # B1.5: display titles at 32pt (reader-visible hierarchy on 13.3" canvas);
     # capped to a single line so a wrap can't overrun the gold divider at y=1.28.
-    _ppt_textbox(slide, 0.42, 0.62, 11.0, 0.62, str(title)[:44], 32,
+    # The cap trims on a word boundary, so the frame never shows a half word.
+    _ppt_textbox(slide, 0.42, 0.62, 11.0, 0.62, clip_title(title), 32,
                  (255, 255, 255), bold=True)
 
     div = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
@@ -191,6 +207,10 @@ def _video_blocks(scene: dict) -> set[str]:
             break
         yy += 50
 
+    if scene.get("status_badges") and room(58):
+        blocks.add("status_badges")
+        yy += 4 + 30 + 54
+
     if scene.get("flow") and room(80):
         yy += 18 + 78
 
@@ -208,6 +228,21 @@ def _video_blocks(scene: dict) -> set[str]:
         if room(box_h + 8):
             blocks.add("code")
             yy += 6 + box_h + 12
+
+    value_table = scene.get("value_table") or []
+    if value_table:
+        rows = min(len(value_table), 4)
+        table_h = 40 + 30 * rows + 12
+        if room(table_h):
+            blocks.add("value_table")
+            yy += 6 + table_h
+
+    for json_lines in _json_payload_candidates(scene):
+        json_h = 16 + len(json_lines) * 20 + 10
+        if room(json_h + 8):
+            blocks.add("json")
+            yy += 6 + json_h + 12
+            break
 
     if scene.get("takeaways"):
         yy += 10 + 32
@@ -261,6 +296,31 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             _ppt_para(tf, b, 18, (235, 238, 245), bullet=True)
             y += need
 
+        if scene.get("status_badges") and "status_badges" in _video_blocks(scene):
+            badge_h = 0.5 + 0.32 * 2
+            if y + badge_h <= max_h:
+                _ppt_textbox(s, 0.52, y, 12.3, 0.26, "VERDICT CODES", 12,
+                             GOLD, bold=True)
+                chips = scene["status_badges"][:6]
+                chip_w = 12.3 / max(len(chips), 1)
+                gutter = 0.2
+                for j, badge in enumerate(chips):
+                    state = str(badge.get("state", "")).upper()
+                    fill = {"PASS": GREEN, "FAIL": RED,
+                            "REVIEW": GOLD}.get(state, MUTED)
+                    chip = s.shapes.add_shape(
+                        MSO_SHAPE.ROUNDED_RECTANGLE,
+                        Inches(0.52 + j * chip_w), Inches(y + 0.3),
+                        Inches(chip_w - gutter), Inches(0.5))
+                    chip.fill.solid()
+                    chip.fill.fore_color.rgb = RGBColor(*fill)
+                    chip.line.fill.background()
+                    text = f"{badge.get('code', '')} {badge.get('label', '')}".strip()
+                    _ppt_textbox(s, 0.6 + j * chip_w, y + 0.38,
+                                 chip_w - gutter + 0.08, 0.34, text, 16,
+                                 (18, 24, 38))
+                y += badge_h
+
         if scene.get("design_decision") and y + 0.92 <= max_h:
             card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                          Inches(0.52), Inches(y),
@@ -300,6 +360,48 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             if y + code_h <= max_h:
                 _ppt_codebox(s, 0.52, y, 12.3, code_lines,
                               str(scene.get("code_context", "")))
+                y += code_h
+
+        blocks = _video_blocks(scene)
+        value_table = (scene.get("value_table") or [])[:4]
+        if value_table and "value_table" in blocks:
+            table_h = 0.45 + 0.3 * len(value_table)
+            if y + table_h <= max_h:
+                card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                          Inches(0.52), Inches(y),
+                                          Inches(12.3), Inches(table_h))
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(26, 34, 52)
+                card.line.fill.background()
+                _ppt_textbox(s, 0.62, y + 0.05, 12.1, 0.26,
+                             "NUMBERS", 12, GOLD, bold=True)
+                for j, row in enumerate(value_table):
+                    cell_left, _, cell_right = str(row).partition("|")
+                    row_y = y + 0.42 + j * 0.3
+                    _ppt_textbox(s, 0.62, row_y, 6.2, 0.28, cell_left.strip(),
+                                 17, (235, 238, 245))
+                    _ppt_textbox(s, 6.9, row_y, 5.9, 0.28, cell_right.strip(),
+                                 17, (140, 200, 255))
+                y += table_h
+
+        if "json" in blocks:
+            for json_lines in _json_payload_candidates(scene):
+                json_h = 0.34 + len(json_lines) * 0.3
+                if y + json_h > max_h:
+                    continue
+                card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                          Inches(0.52), Inches(y),
+                                          Inches(12.3), Inches(json_h))
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(14, 22, 34)
+                card.line.fill.background()
+                _ppt_textbox(s, 0.62, y + 0.04, 12.1, 0.24,
+                             "PAYLOAD", 12, GOLD, bold=True)
+                for j, ln in enumerate(json_lines):
+                    _ppt_textbox(s, 0.62, y + 0.34 + j * 0.3, 12.1, 0.28,
+                                 ln, 16, (180, 220, 255),
+                                 font_name="Courier New")
+                break
 
     if takes:
         # takeaway slide — 2 columns, rows capped so nothing exceeds the budget;

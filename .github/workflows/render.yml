@@ -42,6 +42,9 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+      - name: TTS provider health probe
+        run: uv run doc-to-studio tts-check
+
       - name: Regenerate lesson from source markdown (Docs-as-Code)
         run: |
           uv run doc-to-studio build "$SOURCE" \

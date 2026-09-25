@@ -75,6 +75,24 @@ def _strip_source_metadata_blocks(text: str) -> str:
         lines.append(line)
     return "\n".join(lines)
 
+def clip_title(text: str, limit: int = 44) -> str:
+    """Trim a slide title to ``limit`` characters on a word boundary.
+
+    A hard character cut can leave a title ending mid-word ("...structure
+    before va"), and because the stored title is also what the voice speaks, the
+    broken fragment reaches the audio track too. Cutting back to the last space
+    keeps both surfaces intact. No ellipsis is added: it would be read aloud and
+    would still push the title over one line.
+    """
+    value = " ".join(str(text).split())
+    if len(value) <= limit:
+        return value
+    head = value[:limit]
+    if " " not in head:
+        return head
+    return head[:head.rfind(" ")].rstrip(" -.:,")
+
+
 def _has_source_citation(text: str) -> bool:
     raw = str(text)
     return bool(_SOURCE_CITATION_RE.search(raw)

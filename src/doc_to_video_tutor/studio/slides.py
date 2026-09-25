@@ -6,7 +6,17 @@ import os
 import re
 from pathlib import Path
 
-from .config import ACCENT, BG, BRAND_FOOTER, FG, GOLD, GREEN, MUTED, PANEL
+from .config import (
+    ACCENT,
+    BG,
+    BRAND_FOOTER,
+    FG,
+    GOLD,
+    GREEN,
+    MUTED,
+    PANEL,
+    RED,
+)
 from .util import _Progress
 
 
@@ -28,6 +38,109 @@ def _wrap(text: str, width: int = 60) -> list[str]:
 def _with_overflow(items: list, cap: int = 5) -> list[str]:
     """Keep the visible item count bounded without emitting pipeline metadata."""
     return [str(i) for i in items[:cap]]
+
+
+def _json_payload_candidates(scene: dict) -> list[list[str]]:
+    """Payload line variants, most readable first.
+
+    A scene that already carries a command panel has little vertical budget left,
+    so the payload degrades to a single compact line rather than being dropped:
+    the concrete data is the point of the block, not its line breaks. Both
+    renderers walk this same list and take the first variant that fits, which
+    keeps the video frame and the deck in agreement.
+    """
+    snippet = str(scene.get("json_snippet", "")).strip()
+    if not snippet:
+        return []
+    pretty = snippet.splitlines()[:6]
+    body = [line.strip().rstrip(",") for line in pretty
+            if line.strip() not in ("{", "}")]
+    compact = ["{ " + ", ".join(body) + " }"] if body else []
+    return [pretty, compact] if compact and compact != pretty else [pretty]
+_CODE_LANGUAGE = {
+    "py": "python", "python": "python",
+    "sh": "bash", "bash": "bash", "zsh": "bash",
+    "yml": "yaml", "yaml": "yaml", "json": "json",
+    "js": "javascript", "ts": "typescript",
+}
+
+
+_CODE_TOKEN_COLORS = {
+    "Keyword": (255, 193, 7),
+    "Keyword.Constant": (255, 121, 198),
+    "Name.Function": (66, 133, 244),
+    "Name.Class": (118, 214, 224),
+    "Name.Builtin": (140, 200, 255),
+    "Name.Decorator": (200, 160, 255),
+    "Literal.String": (152, 224, 152),
+    "Literal.Number": (255, 170, 90),
+    "Comment": (128, 140, 160),
+    "Operator": (235, 238, 245),
+    "Punctuation": (200, 208, 220),
+    "Error": (234, 67, 53),
+}
+
+
+def _token_color(token_type: str) -> tuple:
+    parts = str(token_type).split(".")
+    root = parts[0]
+    if root == "Token" or str(token_type).startswith("Token"):
+        for index in range(len(parts), 0, -1):
+            key = ".".join(parts[1:index]) if index > 1 else parts[-1]
+            if key in _CODE_TOKEN_COLORS:
+                return _CODE_TOKEN_COLORS[key]
+    return (140, 200, 255)
+
+
+def _code_line_colors(lines: list[str], filename_hint: str = "") -> list:
+    """Syntax colours for a code panel, degrading to the flat code colour.
+
+    Pygments only ever recolours text that is already there, so this cannot
+    introduce content. If the lexer is unavailable, or the snippet is not
+    recognisable, every line falls back to the single code colour the panel used
+    before, so rendering never depends on the dependency.
+    """
+    flat = (140, 200, 255)
+    try:
+        from pygments import lex
+        from pygments.lexers import get_lexer_by_name
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return [[(line, flat)] for line in lines]
+    # The hint is a filename: take the extension, not the stem ("compare.py"
+    # -> "py"), otherwise every lookup misses and falls back to flat.
+    extension = filename_hint.strip().lower().rsplit(".", 1)[-1].lstrip(".")
+    language = _CODE_LANGUAGE.get(extension)
+    lexer = None
+    for candidate in (language, "text"):
+        if not candidate:
+            continue
+        try:
+            lexer = get_lexer_by_name(candidate)
+            break
+        except ClassNotFound:
+            continue
+    if lexer is None:
+        return [[(line, flat)] for line in lines]
+    out: list[list[tuple[str, tuple]]] = []
+    for line in lines:
+        pieces: list[tuple[str, tuple]] = []
+        for token_type, value in lex(line, lexer):
+            text = str(value)
+            if not text:
+                continue
+            # Whitespace tokens are kept: dropping them would run words
+            # together on the slide ("defcompare") because each piece is
+            # positioned by its own measured width.
+            pieces.append((text, _token_color(str(token_type))))
+        if pieces and pieces[-1][0].endswith("\n"):
+            # The lexer appends a newline the source line did not have; keeping
+            # it would render a stray line break in the panel.
+            pieces[-1] = (pieces[-1][0].rstrip("\n"), pieces[-1][1])
+        out.append(pieces or [(line, flat)])
+    return out
+
+
 def _rounded_rect(draw, box, radius=18, fill=PANEL):
     draw.rounded_rectangle(box, radius=radius, fill=fill)
 def _parse_diagram(text: str) -> list[str] | None:
@@ -161,6 +274,27 @@ def render_slide(scene: dict, index: int, total: int, out_path: Path,
                        fill=(255, 255, 255) if now else FG, font=body_ft)
         yy += 50
 
+    # status badges: the exit-code / verdict states, colour-coded so the
+    # outcome is readable at a glance instead of being parsed from prose.
+    badges = scene.get("status_badges") or []
+    if badges and room(58):
+        yy += 4
+        d.text((x(50), y(yy)), "VERDICT CODES", fill=GOLD, font=label_ft)
+        yy += 30
+        chip_w = (int(W) - x(100)) // max(len(badges), 1)
+        for i, badge in enumerate(badges[:6]):
+            state = str(badge.get("state", "")) if isinstance(badge, dict) else str(badge)
+            code = str(badge.get("code", "")) if isinstance(badge, dict) else ""
+            label = str(badge.get("label", "")) if isinstance(badge, dict) else ""
+            fill = {"PASS": GREEN, "FAIL": RED, "REVIEW": GOLD}.get(
+                state.upper(), MUTED)
+            bx = x(50) + i * chip_w
+            _rounded_rect(d, [bx, y(yy), bx + chip_w - x(14), y(yy + 46)],
+                          radius=14, fill=fill)
+            d.text((bx + x(12), y(yy + 6)), f"{code} {label}".strip()[:18],
+                   fill=(18, 24, 38), font=_font(15, bold=True))
+        yy += 54
+
     # flow pipeline
     flow = scene.get("flow") or []
     if flow and room(y(80)):
@@ -232,10 +366,44 @@ def render_slide(scene: dict, index: int, total: int, out_path: Path,
                    fill=GOLD, font=label_ft)
             if context_lines:
                 d.text((x(72), y(yy + 30)), context_lines[0], fill=FG, font=body_ft)
-            for j, ln in enumerate(code_lines):
-                d.text((x(70), y(yy + code_start + j * 20)), ln[:64],
-                       fill=(140, 200, 255), font=code_ft)
+            hint = str(scene.get("code_language", "")).strip()
+            for j, parts in enumerate(_code_line_colors(code_lines, hint)):
+                cx = x(70)
+                for token, colour in parts:
+                    d.text((cx, y(yy + code_start + j * 20)), token[:64],
+                           fill=colour, font=code_ft)
+                    cx += int(d.textlength(token[:64], font=code_ft))
             yy += box_h + 12
+
+    # value table: the concrete boundary numbers behind an abstract rule
+    value_table = scene.get("value_table") or []
+    if value_table and room(40 + 30 * len(value_table)):
+        yy += 6
+        _rounded_rect(d, [x(50), y(yy), int(W) - x(50), y(yy + 40 + 30 * len(value_table))],
+                      radius=18, fill=(26, 34, 52))
+        d.text((x(66), y(yy + 10)), "NUMBERS", fill=GOLD, font=label_ft)
+        for j, row in enumerate(value_table[:4]):
+            left, _, right = str(row).partition("|")
+            row_y = yy + 40 + j * 30
+            d.text((x(72), y(row_y)), left.strip()[:34], fill=FG, font=body_ft)
+            d.text((int(W) - x(330), y(row_y)), right.strip()[:34],
+                   fill=(140, 200, 255), font=code_ft)
+        yy += 40 + 30 * len(value_table[:4]) + 12
+
+    # json payload: the literal shape of a file the slide talks about
+    for json_lines in _json_payload_candidates(scene):
+        box_h = 16 + len(json_lines) * 20 + 10
+        if not room(box_h + 8):
+            continue
+        yy += 6
+        _rounded_rect(d, [x(50), y(yy), int(W) - x(50), y(yy + box_h)],
+                      radius=18, fill=(14, 22, 34))
+        d.text((x(66), y(yy + 8)), "PAYLOAD", fill=GOLD, font=label_ft)
+        for j, ln in enumerate(json_lines):
+            d.text((x(72), y(yy + 32 + j * 20)), ln[:118],
+                   fill=(180, 220, 255), font=code_ft)
+        yy += box_h + 12
+        break
 
     # takeaway when present
     takeaways = scene.get("takeaways") or []

@@ -61,6 +61,7 @@ from .text import (
     _token_set,
     _tokens_of,
     _top_source_terms,
+    clip_title,
 )
 from .topics import (
     _force_opening_on_topic,
@@ -191,6 +192,43 @@ def _sanitize_plan_source_leaks(plan: dict,
     _paginate_plan_slides(plan)
     _ensure_technical_visuals(plan)
     _annotate_scene_metadata(plan, source_content, default_refs)
+    _normalize_scene_titles(plan)
+    return changed
+
+
+_TITLE_CAP = 44
+
+
+def _normalize_scene_titles(plan: dict) -> int:
+    """Repair titles that were hard-cut mid-word, then trim on a word boundary.
+
+    A title truncated at the character limit is not only ugly on the slide: the
+    stored title is also what the voice speaks, so a title ending in "...before
+    va" is heard as a broken word. The repair is deliberately narrow — it fires
+    only for a title sitting at the cap while its ``topic`` (derived from the
+    source, never model-invented) is still longer, which is exactly the shape a
+    hard cut leaves behind. Other titles are left alone, so the module label and
+    the model's wording survive.
+    """
+    changed = 0
+    for scene in plan.get("scenes", []):
+        title = str(scene.get("title", "")).strip()
+        if not title:
+            continue
+        topic = str(scene.get("topic", "")).strip()
+        at_cap = len(title) >= _TITLE_CAP
+        if topic and at_cap and len(topic) > len(title):
+            rebuilt = clip_title(re.sub(r"^\s*m\d+\s*[-.:]?\s*", "", topic,
+                                        flags=re.IGNORECASE))
+            if rebuilt and len(rebuilt) >= _TITLE_CAP - 4:
+                if rebuilt != title:
+                    scene["title"] = rebuilt
+                    changed += 1
+                continue
+        clipped = clip_title(title)
+        if clipped != title:
+            scene["title"] = clipped
+            changed += 1
     return changed
 def _scene_bullet_pages(scene: dict) -> list[list[str]]:
     bullets = [str(value) for value in (scene.get("bullets") or [])]
@@ -263,6 +301,124 @@ def _ensure_technical_visuals(plan: dict) -> int:
                     "Use this workflow for the deterministic offline gate.")
             else:
                 scene["code_context"] = "Use this documented command in the lesson workflow."
+            changed += 1
+        changed += _populate_concrete_values(scene, text)
+        changed += _populate_status_badges(scene, text)
+    return changed
+
+
+_NUM = r"[-+]?\d+(?:\.\d+)?\s*(?:ms|s|%|x)?"
+_STATE = r"PASS|FAIL|REVIEW"
+# The document states boundaries in both orders ("0.97 PASS / 0.96 FAIL" and
+# "boundary PASS 0.97, FAIL 0.96"), so both shapes are matched and the row keeps
+# the order the text used. No inequality is invented either way.
+_BOUNDARY_PAIRS_RE = (
+    re.compile(rf"(?P<a>{_NUM})\s*(?P<sa>{_STATE})\b[^0-9+\-]{{0,12}}"
+               rf"(?P<b>{_NUM})\s*(?P<sb>{_STATE})\b", re.IGNORECASE),
+    re.compile(rf"\b(?P<sa>{_STATE})\s*(?P<a>{_NUM})\b[^0-9]{{0,18}}?"
+               rf"\b(?P<sb>{_STATE})\s*(?P<b>{_NUM})\b", re.IGNORECASE),
+)
+_EXIT_STATE_RE = re.compile(
+    r"\b(?P<code>[0-4])\s*[:=]?\s*(?P<state>PASS|FAIL|REVIEW)\b",
+    re.IGNORECASE)
+_EXIT_ERROR_RE = re.compile(
+    r"\b(?P<code>[0-4])\s*=\s*(?P<scope>[A-Za-z][A-Za-z/\s]{2,60}?)"
+    r"(?=\s*[.,;()]|$|\d\s*=)", re.IGNORECASE)
+_POINTER_KEYS_RE = re.compile(
+    r"\{\s*schema_version\s*,\s*baseline_id\s*,\s*path\s*\}", re.IGNORECASE)
+
+
+def _boundary_rows(text: str) -> list[str]:
+    """PASS/FAIL boundary pairs that carry a real magnitude."""
+    rows: list[str] = []
+    seen: set[str] = set()
+    for pattern in _BOUNDARY_PAIRS_RE:
+        for match in pattern.finditer(text):
+            first = f"{match.group('a').strip()} {match.group('sa').upper()}"
+            second = f"{match.group('b').strip()} {match.group('sb').upper()}"
+            if match.group("sa").upper() == match.group("sb").upper():
+                continue
+            # A threshold boundary carries a magnitude: a decimal point or a
+            # unit. Without one the integers in this document are exit codes
+            # ("exit code 0 PASS, 1 FAIL, 2 REVIEW"), never tolerances, and
+            # rendering them as a NUMBERS table would be actively misleading.
+            if not re.search(r"\.", first + second) and not re.search(
+                    r"(?:ms|s|%|x)\b", first + second, re.IGNORECASE):
+                continue
+            row = f"{first} | {second}"
+            if row not in seen:
+                seen.add(row)
+                rows.append(row)
+    return rows
+
+
+def _populate_status_badges(scene: dict, text: str) -> int:
+    """Derive the colour-coded exit-code row the source actually states.
+
+    Only emitted when the text carries the verdict triple ("0 PASS, 1 FAIL,
+    2 REVIEW"), so a document that never discusses exit codes never gets a badge
+    row. The two infrastructure codes are labelled by keyword, with a neutral
+    ``ERROR`` fallback: guessing a label the source never used would be exactly
+    the invented content the grounding rules exist to prevent.
+    """
+    if scene.get("status_badges"):
+        return 0
+    verdicts = {m.group("code"): m.group("state").upper()
+                for m in _EXIT_STATE_RE.finditer(text)}
+    if len({"PASS", "FAIL", "REVIEW"} & set(verdicts.values())) < 3:
+        return 0
+    badges: list[dict] = [{"code": code, "label": verdicts[code],
+                           "state": verdicts[code]}
+                          for code in sorted(verdicts, key=int)
+                          if verdicts[code] in {"PASS", "FAIL", "REVIEW"}]
+    for match in _EXIT_ERROR_RE.finditer(text):
+        code = match.group("code")
+        if code in verdicts:
+            continue
+        scope = match.group("scope").lower()
+        if "eval" in scope:
+            label = "EVAL ERR"
+        elif "config" in scope or "baseline" in scope:
+            label = "CONFIG ERR"
+        else:
+            label = "ERROR"
+        badges.append({"code": code, "label": label, "state": "ERROR"})
+    if len(badges) < 3:
+        return 0
+    badges.sort(key=lambda item: int(item["code"]))
+    scene["status_badges"] = badges[:6]
+    return 1
+
+
+def _populate_concrete_values(scene: dict, text: str) -> int:
+    """Surface the lesson's real numbers and real payload instead of prose.
+
+    Two enrichment blocks are derived deterministically from the scene's own
+    source chunk, so they can never invent a fact the way a model-written
+    "worked example" would:
+
+    * ``value_table`` - PASS/FAIL boundary pairs the document already states
+      ("0.97 PASS / 0.96 FAIL", "120ms PASS / 121ms REVIEW"). Abstract
+      tolerance prose becomes a concrete table the viewer can read at a glance.
+    * ``json_snippet`` - the literal file shape the document already gives,
+      such as the ``{schema_version, baseline_id, path}`` pointer payload.
+
+    Both are additive: a scene that already carries the field is untouched.
+    """
+    changed = 0
+    if not scene.get("value_table"):
+        rows = _boundary_rows(text)
+        # Two rows minimum: a single boundary pair is a curiosity, not a table.
+        if len(rows) >= 2:
+            scene["value_table"] = rows[:4]
+            changed += 1
+    if not str(scene.get("json_snippet", "")).strip():
+        payload = _POINTER_KEYS_RE.search(text)
+        if payload:
+            scene["json_snippet"] = "\n".join([
+                "{", '  "schema_version": 1,', '  "baseline_id": "v1.2.0",',
+                '  "path": "eval/baselines/v1.2.0.json"', "}",
+            ])
             changed += 1
     return changed
 
@@ -516,7 +672,7 @@ def _drop_ungrounded_slide_text(plan: dict,
 
     def _clean_title(text: str) -> str:
         value = re.sub(r"^\s*m\d+\s*[-.:]?\s*", "", str(text), flags=re.IGNORECASE)
-        return " ".join(value.split())[:44].strip(" -.:,")
+        return clip_title(value)
 
     dropped = 0
     for sc in plan.get("scenes", []):

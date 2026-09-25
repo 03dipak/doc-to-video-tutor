@@ -128,6 +128,7 @@ from .slides import (  # noqa: F401
     _TTF_REGULAR,
     _font,
     _font_cache,
+    _json_payload_candidates,
     _parse_diagram,
     _render_title_card,
     _rounded_rect,
@@ -174,6 +175,7 @@ from .text import (  # noqa: F401
     _tokens_of,
     _top_source_terms,
     _topic_tokens,
+    clip_title,
 )
 from .topics import (  # noqa: F401
     _force_opening_on_topic,

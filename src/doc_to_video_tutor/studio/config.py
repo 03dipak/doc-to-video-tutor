@@ -251,6 +251,7 @@ PANEL = (30, 40, 60)
 ACCENT = (66, 133, 244)
 GOLD = (255, 193, 7)
 GREEN = (76, 175, 80)
+RED = (234, 67, 53)  # FAIL semantics only; see LLD B2.2 exception
 FG = (235, 238, 245)
 MUTED = (150, 158, 175)
 TITLE_HOLD = 4.0  # seconds the cover card stays before the first scene

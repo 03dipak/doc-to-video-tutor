@@ -34,14 +34,30 @@ class PronunciationRule:
     written: str
     spoken: str
     word_boundary: bool = True
+
+
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six",
+                 "seven", "eight", "nine", "ten", "eleven", "twelve")
+
+
+def _module_rules() -> tuple[PronunciationRule, ...]:
+    """M1..M12 -> "module one".."module twelve".
+
+    Generated from a range rather than listed by hand: a hand-written list had
+    stopped at m6, so a nine-scene lesson spoke "M7", "M8", "M9" raw and the
+    unknown-token audit could not catch them because they are not capitalised
+    words. Word-boundary matching keeps "m1" from firing inside a token such as
+    "rasm1".
+    """
+    return tuple(
+        PronunciationRule(f"m{index}", f"module {_NUMBER_WORDS[index]}")
+        for index in range(1, 13)
+    )
+
+
 _MHE_TECH_PRONUNCIATION: tuple[PronunciationRule, ...] = (
     PronunciationRule("1/(n+1)", "one over n plus one", word_boundary=False),
-    PronunciationRule("m5", "module five"),
-    PronunciationRule("m4", "module four"),
-    PronunciationRule("m3", "module three"),
-    PronunciationRule("m2", "module two"),
-    PronunciationRule("m1", "module one"),
-    PronunciationRule("m6", "module six"),
+    *_module_rules(),
     PronunciationRule("schema_version", "schema version"),
     PronunciationRule("baseline_id", "baseline id"),
     PronunciationRule("run_suite", "run suite"),
@@ -75,6 +91,7 @@ _MHE_TECH_PRONUNCIATION: tuple[PronunciationRule, ...] = (
 )
 _ENGLISH_TECH_PRONUNCIATION: tuple[PronunciationRule, ...] = (
     PronunciationRule("1/(n+1)", "one over n plus one", word_boundary=False),
+    *_module_rules(),
     PronunciationRule("schema_version", "schema version"),
     PronunciationRule("baseline_id", "baseline id"),
     PronunciationRule("run_suite", "run suite"),
