@@ -1114,26 +1114,151 @@ def _first_source_sentences(text: str, limit: int = _SOURCE_CHUNK_LIMIT) -> str:
         kept.append(s)
         total += len(s)
     return " ".join(kept).strip()
+# Source-chunk assignment. Weights are applied to per-field *normalised*
+# coverage, so they express which scene field is more trustworthy, not how much
+# text that field happens to contain.
+_CHUNK_W_TITLE = 0.55
+_CHUNK_W_DECISION = 0.25
+_CHUNK_W_BULLETS = 0.20
+# Below this the best available section is not really about the scene, so no
+# excerpt is attached at all. Hydration then skips the scene instead of
+# hydrating it from an unrelated part of the document.
+_CHUNK_MIN_CONFIDENCE = 0.18
+
+def _text_digest(text: str) -> str:
+    """Short content digest of a source section, for provenance."""
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _scene_chunk_weights(scene: dict) -> dict[str, float]:
+    """Per-field weighted anchor tokens for source-chunk matching.
+
+    Each field is normalised by its own token count before weighting, so a scene
+    with five long bullets cannot outvote its own title purely by having more
+    text. Field *size* deciding influence was the reason "M4 Tolerance units"
+    was matched to the document's overview section: the title scored a tie and
+    five bullets broke it the wrong way.
+    """
+    buckets: list[tuple[float, list[str]]] = [
+        (_CHUNK_W_TITLE, _nar_tokens(str(scene.get("title", "")))),
+        (_CHUNK_W_DECISION,
+         _nar_tokens(str(scene.get("design_decision", "")))),
+        (_CHUNK_W_BULLETS,
+         [tok for b in (scene.get("bullets") or [])
+          for tok in _nar_tokens(str(b))]),
+    ]
+    out: dict[str, float] = {}
+    for weight, tokens in buckets:
+        unique = set(tokens)
+        if not unique:
+            continue
+        share = weight / len(unique)
+        for tok in unique:
+            out[tok] = out.get(tok, 0.0) + share
+    return out
+
+
+def _chunk_match_score(scene: dict, section_tokens: set[str]) -> float:
+    """Weighted fraction of the scene's anchor vocabulary present in a section."""
+    anchor = _scene_chunk_weights(scene)
+    if not anchor:
+        return 0.0
+    total = sum(anchor.values())
+    if total <= 0:
+        return 0.0
+    return sum(w for t, w in anchor.items() if t in section_tokens) / total
+
+
 def _annotate_source_chunks(plan: dict, content: str) -> int:
-    """Attach a short real source excerpt to each scene (in place)."""
+    """Attach a short real source excerpt to each scene (in place).
+
+    Three defects in the previous version, each measured on `mod03_gates_v021`
+    where 5 of 9 scenes received the wrong excerpt:
+
+    1. It scored the section *body* only. `_markdown_sections` returns
+       `(heading, body)`, so the document's most discriminative text - the
+       concept name in the heading - was never in the comparison set at all.
+       "The 11-step precedence" could not match "### 6. The 11-step precedence"
+       because the latter's heading was invisible to the matcher.
+    2. It took a per-scene argmax, so several scenes collapsed onto the same
+       section: two scenes shared the overview and two shared "Kind = verdict
+       semantics". Assignment is now global and exclusive.
+    3. It had no floor. `best_score = -1` meant a section with *zero* overlap
+       still won, so an unrelated excerpt could be attached with nothing to
+       show for it.
+
+    Assignment is a greedy best-score-first pass over every (scene, section)
+    pair, which keeps it deterministic and O(scenes x sections). Because a greedy
+    pass cannot be trusted to be right, each scene also records *why* it was
+    assigned: a plan-level `source_assignment` list carries the heading, the
+    score, and whether the score cleared `_CHUNK_MIN_CONFIDENCE`. A scene that
+    does not clear the floor keeps no excerpt, and hydration and enrichment
+    simply do not run for it - which is honest, where attaching the overview
+    because nothing matched is not.
+    """
     sections = _markdown_sections(content)
+    if not sections:
+        return 0
+    # Heading AND body: the heading names the concept, the body explains it.
+    # The leading hashes are stripped first - `_nar_tokens` keeps '#' as a
+    # character, so an untokenised "##"/"###" lands in the section's token set
+    # and pollutes the comparison. `_nar_tokens` itself is left alone: it is the
+    # shared Layer A tokenizer and changing it would move every repeat rule.
+    section_tokens = [set(_nar_tokens(f"{head.lstrip('#').strip()}\n{body}"))
+                      for head, body in sections]
+    scenes = list(plan.get("scenes", []))
+
+    pairs = sorted(
+        ((_chunk_match_score(sc, tokens), si, i)
+         for si, sc in enumerate(scenes) for i, tokens in
+         enumerate(section_tokens)),
+        key=lambda p: (-p[0], p[1], p[2]))
+    assigned: dict[int, tuple[int, float]] = {}
+    taken: set[int] = set()
+    for score, si, i in pairs:
+        if si in assigned or i in taken:
+            continue
+        assigned[si] = (i, score)
+        taken.add(i)
+
     annotated = 0
-    for sc in plan.get("scenes", []):
-        anchor = set(_nar_tokens(" ".join([
-            str(sc.get("title", "")),
-            *[str(b) for b in (sc.get("bullets") or [])],
-            str(sc.get("design_decision", ""))])))
-        best = ""
-        best_score = -1
-        for _head, body in sections:
-            score = len(anchor & set(_nar_tokens(body)))
-            if score > best_score:
-                best, best_score = body, score
-        chunk = _first_source_sentences(best) if best else _first_source_sentences(content)
-        if chunk:
-            sc["source_chunk"] = chunk
-            annotated += 1
+    records: list[dict] = []
+    for si, sc in enumerate(scenes):
+        sc.pop("source_chunk", None)
+        if si not in assigned:
+            records.append({"scene": si + 1, "status": "unassigned",
+                            "reason": "no source section available"})
+            continue
+        i, score = assigned[si]
+        head = str(sections[i][0]).strip()
+        if score < _CHUNK_MIN_CONFIDENCE:
+            records.append({
+                "scene": si + 1, "status": "low_confidence",
+                "heading": head, "score": round(score, 4),
+                "reason": f"best match scored {score:.2f}, below the "
+                          f"{_CHUNK_MIN_CONFIDENCE:.2f} floor; no excerpt "
+                          f"attached so hydration cannot use an unrelated one"})
+            continue
+        chunk = _first_source_sentences(sections[i][1])
+        if not chunk:
+            records.append({"scene": si + 1, "status": "empty_section",
+                            "heading": head, "score": round(score, 4)})
+            continue
+        sc["source_chunk"] = chunk
+        annotated += 1
+        records.append({
+            "scene": si + 1, "status": "assigned", "heading": head,
+            "score": round(score, 4),
+            "section_index": i,
+            # A content digest, not the heading string: the heading is display
+            # metadata and can be duplicated or edited after the fact.
+            "section_digest": _text_digest(f"{head}\n{sections[i][1]}"),
+        })
+    plan["source_assignment"] = records
     return annotated
+
 def _scene_problem_map(plan: dict, topics: list[str],
                        source_bigrams: set[tuple[str, str]],
                        source_tokens: set[str],

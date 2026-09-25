@@ -783,3 +783,58 @@ def test_scene_title_repair_targets_only_truncated_titles() -> None:
     assert not repaired.endswith("va")
     # A title that was never truncated keeps the model's wording and label.
     assert plan["scenes"][1]["title"] == "M4 Tolerance units"
+
+
+def test_source_chunk_assignment_matches_headings_and_stays_exclusive() -> None:
+    """Chunk assignment must see the heading, and no section may serve two scenes.
+
+    Both properties were missing: `_markdown_sections` returns (heading, body)
+    and the matcher compared against the body only, so the document's most
+    discriminative text was never in the comparison set. And a per-scene argmax
+    let several scenes collapse onto the same overview section.
+    """
+    from doc_to_video_tutor.studio.plan import _annotate_source_chunks
+
+    doc = (
+        "# Guide\n\n"
+        "## Overview\n\n"
+        "Baselines tolerance units precedence verdict are all mentioned here so "
+        "this summary section overlaps every scene in the document.\n\n"
+        "### 1. Baseline snapshot\n\n"
+        "Freeze a known good baseline snapshot and diff every new run against "
+        "it to see what changed.\n\n"
+        "### 2. Tolerance units\n\n"
+        "Tolerance is expressed in two units, and the two units must agree "
+        "before a verdict is allowed to pass.\n"
+    )
+    plan = {"scenes": [
+        {"title": "Baseline snapshot", "bullets": ["diff every new run"],
+         "design_decision": "freeze a known good baseline"},
+        {"title": "Tolerance units", "bullets": ["the two units must agree"],
+         "design_decision": "tolerance is expressed in two units"},
+    ]}
+    assert _annotate_source_chunks(plan, doc) == 2
+    records = plan["source_assignment"]
+    assert [r["status"] for r in records] == ["assigned", "assigned"]
+    # Each scene landed on its own concept section, not on the overview.
+    assert "Baseline snapshot" in records[0]["heading"]
+    assert "Tolerance units" in records[1]["heading"]
+    assert records[0]["heading"] != records[1]["heading"]
+    # Provenance is recorded as a content digest, not just a display string.
+    for record in records:
+        assert len(record["section_digest"]) == 16
+
+
+def test_source_chunk_assignment_refuses_a_weak_match() -> None:
+    """No confident match means no excerpt, not an unrelated one."""
+    from doc_to_video_tutor.studio.plan import _annotate_source_chunks
+
+    doc = ("# Guide\n\n### Alpha\n\n"
+           "zqx wibble frobnicate gronk.\n")
+    plan = {"scenes": [{"title": "Tolerance units",
+                        "bullets": ["narration safety gate"],
+                        "design_decision": "block the provider call"}]}
+    assert _annotate_source_chunks(plan, doc) == 0
+    assert "source_chunk" not in plan["scenes"][0]
+    record = plan["source_assignment"][0]
+    assert record["status"] in ("low_confidence", "unassigned")
