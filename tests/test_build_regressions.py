@@ -11,6 +11,9 @@ actually emitted, the 71-word scene, the fused token - because a paraphrased
 fixture would test the idea rather than the incident.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 from doc_to_video_tutor import studio as S
@@ -821,3 +824,85 @@ def test_chrome_boxes_cannot_collide() -> None:
     counter_left = 11.20
     assert eyebrow_bottom <= title_top, "eyebrow hangs into the title"
     assert title_right <= counter_left, "title runs under the page counter"
+
+
+# --- every content shape must land inside the safe area -------------------
+#
+# Slide 9 of mod03_gates_v012_010 drew a payload card from 5.59in to 7.78in on
+# a 7.5in slide - a full inch past the 6.9in safe bottom. The card itself was
+# sized correctly, so an overlap check did not fire and the audit said nothing
+# was wrong. The layout was not crowded; it ran off the canvas.
+#
+# Cause: the diagram block advanced the local `y` cursor without going through
+# `_RowStack`, so the stack's cursor fell behind. The stack then believed more
+# room was left than really existed and admitted a block that could not fit.
+# Two cursors, one of them stale, is precisely what a single shared budget
+# exists to prevent - so the fix routes the diagram through the stack, and this
+# test checks the safe area directly rather than trusting any bookkeeping.
+
+def test_no_content_shape_lands_past_the_safe_bottom(tmp_path) -> None:
+    """Catches off-canvas content that no overlap check would notice."""
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    emu = 914400.0
+    safe_bottom = 6.9
+    offenders: list[str] = []
+
+    def check(plan, tag) -> None:
+        out = Path(tmp_path) / f"{tag}.pptx"
+        build_pptx(plan, out)
+        for index, slide in enumerate(Presentation(str(out)).slides, 1):
+            for shape in slide.shapes:
+                if not shape.width or not shape.height:
+                    continue
+                bottom = (shape.top + shape.height) / emu
+                # The footer legitimately sits below the content safe area.
+                if shape.top / emu > 6.95:
+                    continue
+                if bottom > safe_bottom + 0.02:
+                    text = (shape.text_frame.text.strip()[:28]
+                            if shape.has_text_frame else "<card>")
+                    offenders.append(
+                        f"{tag} slide {index}: bottom {bottom:.2f}in {text!r}")
+
+    # 1. the real plan that produced the defect
+    src = Path("output/mod03_gates_v012_010.plan.json")
+    if src.exists():
+        check(json.loads(src.read_text(encoding="utf-8"))["plan"], "real")
+
+    # 2. a synthetic worst case, so the invariant does not depend on one lesson
+    check({"title": "T", "takeaways": [], "scenes": [{
+        "section": "S", "title": "Everything at once", "topic": "t",
+        "narration": "n" * 40, "source_refs": ["s"],
+        "bullets": [f"B{i}: " + ("long teaching sentence needing real room. " * 4)
+                    for i in range(6)],
+        "visual_diagram": "[A] ---> [B] ---> [C] ---> [D]",
+        "design_decision": "why this and not the alternative. " * 6,
+        "analogy": "an analogy needing its own card. " * 5,
+        "json_snippet": '{"schema_version": 1, "baseline_id": "v1.2.0",\n'
+                        ' "path": "eval/baselines/v1.2.0.json",\n'
+                        ' "kind": "gate", "tolerance": 0.03}',
+        "code_snippet": "def compare(base):\n    return diff(base)",
+    }]}, "synthetic")
+
+    assert not offenders, offenders
+
+
+def test_every_block_advances_the_shared_stack() -> None:
+    """No block may advance the local cursor behind the stack's back."""
+    import inspect
+    import re
+
+    from doc_to_video_tutor.studio import pptx as P
+
+    src = inspect.getsource(P.build_pptx)
+    # Every `y +=` in the slide body must be paired with a stack reservation.
+    # The takeaway flow deliberately manages its own columns, so scope the check
+    # to the scene-slide section.
+    body = src.split("if takes:")[0]
+    bare_advances = [m.group(0).strip() for m in
+                     re.finditer(r"^\s+y \+= .*$", body, re.M)]
+    assert not bare_advances, (
+        f"these advance the local cursor without the shared stack: {bare_advances}")

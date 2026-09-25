@@ -590,9 +590,15 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 y = stack.y
 
         diagram = _parse_diagram(scene.get("visual_diagram") or "")
-        if diagram and y + 0.9 <= max_h:
+        # Through the stack, like every other block. It used to advance the
+        # local `y` only, which left `stack.y` behind: the stack then believed
+        # there was more room than there was and admitted a payload card that
+        # ran from 5.59in to 7.78in, a full inch past the 6.9in safe bottom.
+        # Two cursors, one of them stale, is the failure mode a single shared
+        # budget exists to prevent.
+        if diagram and stack.reserve(0.9, _RowStack.OPTIONAL, "diagram") is not None:
             _ppt_diagram(s, 0.52, y, 12.3, diagram)
-            y += 0.9
+            y = stack.y
 
         code_text = scene.get("code_snippet")
         if code_text and "code" in _video_blocks(scene):
@@ -602,7 +608,9 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             if stack.reserve(code_h, _RowStack.OPTIONAL, "code panel") is not None:
                 _ppt_codebox(s, 0.52, y, 12.3, code_lines,
                               str(scene.get("code_context", "")))
-                y += code_h
+                # The stack already advanced; read it back rather than
+                # advancing a second cursor by the same amount.
+                y = stack.y
 
         blocks = _video_blocks(scene)
         value_table = (scene.get("value_table") or [])[:4]
