@@ -641,8 +641,11 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                     row_y += row_heights[j]
                 y = stack.y
 
-        # 1-based for humans; the loop index is 0-based.
-        slide_notes.extend(f"slide {i + 1}: {n}" for n in stack.report())
+        # Same index the counter on this slide prints, so a note points at the
+        # slide the reader can see. It was `i + 1`, which is off by one against
+        # the `i + 2` above: slide 1 is the title, so the first scene slide is 2.
+        this_slide = i + 2
+        slide_notes.extend(f"slide {this_slide}: {n}" for n in stack.report())
         if "json" in blocks:
             for json_lines in _json_payload_candidates(scene):
                 line_heights = [_est_text_height(ln, 12.1, 16)
@@ -722,9 +725,12 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                              (235, 238, 245))
                 tb = s.shapes[-1]
                 _ppt_para(tb.text_frame, take, 18, (235, 238, 245), bullet=True)
+                # `deck_total` is a count of slides, not this slide's index, and
+                # with takeaway pagination they differ. Use the same arithmetic
+                # as the counter: title + scene slides + this takeaway page.
                 slide_notes.append(
-                    f"slide {deck_total}: takeaway exceeds one column and was "
-                    f"clipped to a single slide: {take[:32]!r}")
+                    f"slide {1 + len(page_scenes) + page}: takeaway exceeds one "
+                    f"column and was clipped to a single slide: {take[:32]!r}")
 
     for note in slide_notes:
         print(f"  [WARN] layout: {note}")

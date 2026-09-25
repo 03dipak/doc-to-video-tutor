@@ -1112,3 +1112,31 @@ text returns True, since the raw has a brace and bracket imbalance of +2. Both
 computations run on the same string in the same function, so the discrepancy is
 not explained. It is cosmetic — the raw is refused either way — and it is left
 open rather than guessed at.
+
+### 22.9 Diagnostics must name the slide they are about
+
+A layout note reported `slide {deck_total}`. `deck_total` is a **count** of
+slides, not the index of the slide carrying the problem, and with the takeaway
+pagination of §20.2 defect 19 the two differ — so the note pointed at a slide
+that was not the broken one. A diagnostic naming the wrong slide costs more than
+no diagnostic, because it sends the reader somewhere else to look.
+
+Checking the same code turned up a second instance of the same mistake. Scene
+notes used `i + 1` while the counter printed on that very slide used `i + 2`,
+since slide 1 is the title. Every scene note was off by one.
+
+Both now derive their index from the counter's own arithmetic, so the two cannot
+drift again:
+
+- scene notes take `this_slide = i + 2`, the same offset the counter uses;
+- takeaway notes use `1 + len(page_scenes) + page`.
+
+A test asserts the offset in the counter expression is 2 and that the notes
+reuse it, a second asserts no note in the takeaway section uses `deck_total` as
+an index, and a third forces a real drop and checks the number printed lies
+within the deck's actual slide count.
+
+The general rule this exposes: a diagnostic that names a location is only useful
+if the location is derived from the same source of truth as the thing it
+describes. `deck_total` was a plausible-looking number that meant something else,
+and no amount of reading the message would have revealed that.

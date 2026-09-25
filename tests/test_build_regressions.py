@@ -906,3 +906,81 @@ def test_every_block_advances_the_shared_stack() -> None:
                      re.finditer(r"^\s+y \+= .*$", body, re.M)]
     assert not bare_advances, (
         f"these advance the local cursor without the shared stack: {bare_advances}")
+
+
+# --- diagnostics must name the slide they are about ----------------------
+#
+# A layout note reported `slide {deck_total}`, which is a COUNT of slides, not
+# the index of the slide carrying the problem. With takeaway pagination the two
+# differ, so the note pointed at a slide that was not the broken one - and a
+# diagnostic that names the wrong slide costs more than no diagnostic.
+#
+# Checking the same code found a second one: scene-slide notes used `i + 1`
+# while the counter printed on that very slide used `i + 2`, because slide 1 is
+# the title. Every scene note was off by one.
+
+def test_scene_notes_use_the_same_index_as_the_printed_counter() -> None:
+    import inspect
+    import re
+
+    from doc_to_video_tutor.studio import pptx as P
+
+    src = inspect.getsource(P.build_pptx)
+    counter = re.search(r'f"\{i \+ (\d+)\} / \{deck_total\}"', src)
+    assert counter, "the scene-slide counter expression moved"
+    offset = int(counter.group(1))
+    assert offset == 2, (
+        f"scene slides are numbered from {offset}; slide 1 is the title so "
+        f"the first scene slide is 2")
+    assert f"this_slide = i + {offset}" in src, (
+        "scene notes must derive their index from the counter's own offset")
+
+
+def test_takeaway_notes_do_not_use_the_deck_total_as_an_index() -> None:
+    import inspect
+
+    from doc_to_video_tutor.studio import pptx as P
+
+    src = inspect.getsource(P.build_pptx)
+    body = src.split("if takes:")[1] if "if takes:" in src else ""
+    assert "slide {deck_total}" not in body, (
+        "deck_total is a slide COUNT; using it as an index names the wrong "
+        "slide whenever the takeaways paginate")
+    assert "1 + len(page_scenes) + page" in body
+
+
+def test_a_forced_note_names_the_slide_that_actually_carries_it(tmp_path) -> None:
+    """End to end: overflow one scene, then check the number in the message."""
+    import contextlib
+    import io
+    import tempfile
+
+    from doc_to_video_tutor.studio import pptx as P
+
+    # Enough blocks that the stack must drop something, so a note is emitted.
+    scenes = [{"section": f"S{i}", "title": f"Scene {i}", "topic": "t",
+               "narration": "n" * 40, "source_refs": ["s"],
+               "bullets": [f"B{j}: " + ("long teaching sentence. " * 8)
+                           for j in range(5)],
+               "design_decision": "why this. " * 40,
+               "analogy": "an analogy. " * 40,
+               "visual_diagram": "[A] ---> [B] ---> [C]",
+               "json_snippet": '{"a": 1, "b": 2}',
+               "code_snippet": "def f():\n    return 1"}
+              for i in range(3)]
+    out = Path(tempfile.mkdtemp()) / "d.pptx"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        P.build_pptx({"title": "T", "scenes": scenes, "takeaways": []}, out)
+    printed = [ln for ln in buf.getvalue().splitlines() if "[WARN] layout" in ln]
+    assert printed, "expected at least one layout note for this input"
+
+    # The deck paginates, so the bound is the real slide count, not one per scene.
+    from pptx import Presentation
+
+    total = len(Presentation(str(out)).slides._sldIdLst)
+    for line in printed:
+        number = int(line.split("slide ")[1].split(":")[0])
+        assert 1 <= number <= total, (
+            f"note names slide {number}, but the deck has {total} slides: "
+            f"{line.strip()}")
