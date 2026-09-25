@@ -251,14 +251,40 @@ def test_saved_source_protected_trigrams_reused_from_plan() -> None:
 
 
 def test_narration_under_run_warning_flags_short_lessons() -> None:
+    """The pre-audio estimate must track the measured speaking pace.
+
+    Regression guard for the calibration: `mod03_gates_v023` rendered 383 spoken
+    words into 223.0 s of measured clip time (103.1 wpm). At the old 135 wpm the
+    estimate read 2.84 min against a 4.0 min target - a false 71% under-run on a
+    lesson that actually measured 93%. These cases pin both ends.
+    """
     from doc_to_video_tutor.studio.cli import narration_under_run_warning
 
-    # 373 spoken words at the 135 WPM model is ~2.8 min against a 4.0 min target.
-    warning = narration_under_run_warning(373, 4.0)
+    # The real lesson: 93% of target measured, so the estimate must agree.
+    assert narration_under_run_warning(383, 4.0) is None
+    # A genuinely thin lesson still warns.
+    warning = narration_under_run_warning(150, 4.0)
     assert warning is not None
     assert "under-run" in warning
-    assert "69%" in warning
-    # A lesson that meets the target must not warn.
+    # A lesson that exceeds the target must not warn either.
     assert narration_under_run_warning(578, 4.0) is None
     # No target means nothing to compare against.
     assert narration_under_run_warning(373, 0.0) is None
+
+
+def test_report_measured_duration_prefers_measurement(monkeypatch, capsys) -> None:
+    """Once audio exists the ffprobe measurement is the authoritative number."""
+    from pathlib import Path
+
+    from doc_to_video_tutor.studio import video
+
+    # Five clips totalling 223.0 s == 3.72 min against a 4.0 min target (93%).
+    monkeypatch.setattr(video, "_clip_seconds",
+                        lambda _p: 223.0 / 5)
+    video._report_measured_duration([Path(f"c{i}.mp3") for i in range(5)],
+                                    {"target_minutes": 4.0})
+    out = capsys.readouterr().out
+    assert "3.72 min measured" in out
+    assert "93%" in out
+    assert "[PASS]" in out
+    assert "lesson_duration_short" not in out

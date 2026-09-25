@@ -286,7 +286,52 @@ def synth_scenes(script: dict, work_dir: Path, voice: str | None
     if dead:
         print(f"  WARN: {len(dead)} clip(s) look truncated or silent: "
               f"{', '.join(dead[:4])}")
+    _report_measured_duration(paths, script)
     return paths, all_timings
+
+
+def _clip_seconds(path: Path) -> float:
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30)
+        return float(out.stdout.strip())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _report_measured_duration(paths: list[Path], script: dict) -> None:
+    """Report the rendered duration and re-check the target against measurement.
+
+    The pre-audio gate can only estimate, because it runs before the provider is
+    called. Once the clips exist the estimate is no longer needed and is in fact
+    misleading: on mod03_gates_v023 the estimate said 2.84 min against a 4.0 min
+    target (71%, warning) while ffprobe measured 3.72 min (93%, no warning). Any
+    duration policy built on the estimate would have chased a defect that was not
+    there. So the authoritative number is printed from the audio, and the
+    under-run check is re-evaluated against it.
+    """
+    target = float(script.get("target_minutes") or 0.0)
+    total = sum(_clip_seconds(p) for p in paths)
+    if total <= 0:
+        return
+    measured_min = total / 60.0
+    if target <= 0:
+        print(f"  duration  : {measured_min:.2f} min measured "
+              f"({total:.1f}s across {len(paths)} clips)")
+        return
+    ratio = measured_min / target
+    verdict = "PASS" if ratio >= 0.92 else ("WARN" if ratio >= 0.80 else "FAIL")
+    print(f"  duration  : {measured_min:.2f} min measured vs {target:.2f} min "
+          f"target = {ratio:.0%} [{verdict}]")
+    if verdict != "PASS":
+        print(f"  [WARN] lesson_duration_short: rendered audio reaches only "
+              f"{ratio:.0%} of the declared target. This is a content-density "
+              f"signal, not a narration-safety failure - the fix is more "
+              f"source-grounded teaching, never padding (LLD 22.6)")
 
 
 def _audit_clip_health(paths: list[Path]) -> list[str]:

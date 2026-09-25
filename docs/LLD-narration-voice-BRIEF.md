@@ -149,7 +149,7 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 | Scenes / clips | 9 scenes, 10 clips |
 | Loudness | −16.0 LUFS (target −16 ±2) |
 | True peak | −1.5 dBTP, no clipping |
-| Spoken duration | 2.8 min vs 4.0 min target (−30%) |
+| Spoken duration | **3.72 min measured** (ffprobe, 223.0 s over 10 clips) vs 4.0 min target = 93%. The earlier "2.8 min / −30%" figure was an *estimate* from a hardcoded 135 wpm and was ~31% off; see defect 1 |
 | Word timings | 383 over 10 clips; 9/9 scenes aligned against real clip durations |
 | Banned repeats | 0 |
 | Slide-meta leaks | 0 |
@@ -160,7 +160,7 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 
 | # | Defect | Why it matters |
 |---|---|---|
-| 1 | **Narration under-runs by 30%** (2.8 min vs 4.0 min target) | The gates accept it: every scene clears the 25-word floor, but the lesson is materially shorter than intended. Is the target wrong, or is the floor too permissive? |
+| 1 | ~~**Narration under-runs by 30%**~~ **NOT A DEFECT — the metric was wrong** | The 30% came from estimating duration as `words / 135 wpm` before TTS. ffprobe on the rendered clips measures 223.0 s = 3.72 min = 93% of target, which passes. `LOUDNESS_WPM` is recalibrated to the measured 103.1, and `_render_media` now reports the measured duration as authoritative. The residual real question is narrower: is 93% the right bar, given the audio also carries 32 s of internal silence and 27 s of inter-scene pause? |
 | 2 | **`source_chunk` misalignment** on ~5/9 scenes; one scene received the "5 big ideas" chunk instead of its tolerance concept | Grounding and hydration both read `source_chunk`, so a wrong chunk means wrong source enrichment *and* wrong repair material. Root cause looks like chunk assignment before scene construction. |
 | 3 | **Fused token**: `ki` + `deterministic` renders as `kideterministic` | TTS reads a non-word. Needs a fusion guard, but any guard risks false positives on legitimate joins. |
 | 4 | **Dangling semantic title** on a continuation page | Reads as unfinished. |
@@ -173,9 +173,10 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 
 1. **Under-run (defect 1).** The narration gate is per-scene; the target is
    per-lesson. Should there be a whole-lesson duration floor, or is the per-scene
-   word floor the right control and the 4.0 min target simply wrong for a
-   9-scene lesson? I lean toward the latter but cannot justify 2.8 min as
-   intentional.
+   word floor the right control, and should the bar be measured or estimated?
+   We now measure. What I cannot answer is whether 93% is a good target for
+   technical teaching, or whether 3.72 min of speech for this content is
+   genuinely thin. That needs a human read, not a formula.
 
 2. **Grounding (defect 2).** What is the right way to assign source chunks to
    scenes so that the chunk feeding a scene is the one about that scene's

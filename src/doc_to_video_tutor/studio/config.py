@@ -20,7 +20,14 @@ TTS_LOUDNORM = os.getenv("TTS_LOUDNORM", "on")
 LOUDNESS_TARGET = float(os.getenv("LOUDNESS_TARGET", "-16.0"))  # LUFS, integrated
 LOUDNESS_TP = float(os.getenv("LOUDNESS_TP", "-1.5"))  # dBTP true peak
 LOUDNESS_LRA = 11.0  # LU, range gate
-LOUDNESS_WPM = 135.0  # measured TTS speaking pace at -8% for the duration model
+# Speaking pace used ONLY for the pre-audio duration estimate, where no audio
+# exists yet. Calibrated by measurement, not by reading the rate off the TTS
+# setting: mod03_gates_v023 rendered 383 spoken words across 223.0 s of ffprobe-
+# measured clip time, i.e. 103.1 words/min at -8% for the mhe-mix profile. The
+# previous 135.0 was ~31% high, which made a 3.72 min lesson look like 2.84 min
+# and fired a false under-run warning. Once audio exists, _render_media reports
+# the measured duration and re-checks against that instead of this constant.
+LOUDNESS_WPM = 103.0
 _SCHEMA_VERSION = 2
 _REPEAT_POLICY_VERSION = 2
 STUDIO_PROMPT = """You are an expert educator preparing a classroom lesson.
