@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from .config import LOUDNESS_LRA, LOUDNESS_TARGET, LOUDNESS_TP, TITLE_HOLD, TTS_LOUDNORM, TTS_VOICE
@@ -366,6 +367,95 @@ def _audit_clip_health(paths: list[Path]) -> list[str]:
         if size < 1024 or total > 6.0:
             flagged.append(path.name)
     return flagged
+_VTT_CUE_WORDS = 8          # words per caption cue before a forced break
+_VTT_BREAKS = ".!?।"   # end a cue at sentence punctuation
+
+
+def _write_webvtt(out_base: Path, script: dict,
+                  timings: Sequence[Sequence[dict] | None],
+                  audios: Sequence[Path] | None = None,
+                  pause: float = 3.0) -> int:
+    """Write a WebVTT caption track from the provider's own word stream.
+
+    `edge_tts.SubMaker` builds cues from the very same `WordBoundary` events that
+    drive reveal sync, so this costs nothing beyond a file write and needs no
+    alignment model. WebVTT is the interoperable form - any player or editor
+    reads it - whereas the JSON sidecar is a private format only this pipeline
+    consumes. Both are emitted because they answer different questions: the VTT
+    is for a human watching the lesson, the JSON for the renderer.
+
+    Clip-local offsets are rebased onto the assembled timeline, including the
+    inter-scene pause, so cue times line up with the rendered MP4 rather than
+    with the individual clip files. Failure is non-fatal by design: a missing
+    caption track must never cost a rendered lesson.
+    """
+    try:
+        import edge_tts
+    except ImportError:
+        return 0
+    maker = edge_tts.SubMaker()
+    fed = 0
+    base_s = 0.0
+    try:
+        for position, words in enumerate(timings):
+            if not words:
+                base_s += pause
+                continue
+            group: list[str] = []
+            group_start = 0.0
+            group_end = 0.0
+            for word in words:
+                start = base_s + float(word.get("start", 0.0))
+                end = start + float(word.get("duration", 0.0))
+                text = str(word.get("text", "")).strip()
+                if not text:
+                    continue
+                if not group:
+                    group_start = start
+                group.append(text)
+                group_end = end
+                # Break on sentence punctuation or on length, so a cue reads as
+                # a phrase. SubMaker emits exactly one cue per feed, so feeding
+                # raw word boundaries would caption the lesson one word at a
+                # time - technically synced, practically unreadable.
+                if len(group) >= _VTT_CUE_WORDS or text[-1] in _VTT_BREAKS:
+                    maker.feed({"type": "WordBoundary",
+                                "offset": int(group_start * 1e7),
+                                "duration": int(max(group_end - group_start, 0.0)
+                                                * 1e7),
+                                "text": " ".join(group)})
+                    fed += 1
+                    group = []
+            if group:
+                maker.feed({"type": "WordBoundary",
+                            "offset": int(group_start * 1e7),
+                            "duration": int(max(group_end - group_start, 0.0)
+                                            * 1e7),
+                            "text": " ".join(group)})
+                fed += 1
+            # Advance by the clip's MEASURED duration, not by its last word
+            # offset: every clip carries trailing silence after the final word,
+            # so advancing on word offsets drifts the captions progressively
+            # earlier and would leave the last scene's cues on top of the first.
+            spoken = (float(words[-1].get("start", 0.0))
+                      + float(words[-1].get("duration", 0.0)))
+            measured = 0.0
+            if audios is not None and position < len(audios):
+                measured = _clip_seconds(audios[position])
+            base_s += (measured or spoken) + pause
+        srt = maker.get_srt()
+    except Exception as exc:  # provider shape drift must not lose the render
+        print(f"  WARN: caption export skipped ({type(exc).__name__}: {exc})")
+        return 0
+    if not fed or not srt.strip():
+        return 0
+    # SRT and WebVTT share cue timing; only the header and the millisecond
+    # separator differ, so convert rather than re-deriving timings a second way.
+    Path(f"{out_base}.vtt").write_text(
+        "WEBVTT\n\n" + srt.replace(",", ".").strip() + "\n", encoding="utf-8")
+    return fed
+
+
 def assemble_video(slide_groups: list[list[Path]], audios: list[Path],
                    out_path: Path, pause: float = 3.0, end_hold: float = 6.0,
                    timings: list[list[dict] | None] | None = None,
@@ -479,6 +569,9 @@ def _render_media(plan: dict, out_base: Path, script: dict, voice: str | None,
     spoken_words = sum(len(entry["words"]) for entry in word_timings["clips"])
     print(f"  word sync  : {spoken_words} word timings captured "
           f"-> {out_base}.word_timings.json")
+    vtt_cues = _write_webvtt(out_base, script, timings, audios)
+    if vtt_cues:
+        print(f"  captions   : {vtt_cues} cues -> {out_base}.vtt")
     audio_dir = Path(f"{out_base}_audio")
     audio_dir.mkdir(exist_ok=True)
     for a in audios:

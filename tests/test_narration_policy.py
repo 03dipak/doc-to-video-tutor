@@ -288,3 +288,44 @@ def test_report_measured_duration_prefers_measurement(monkeypatch, capsys) -> No
     assert "93%" in out
     assert "[PASS]" in out
     assert "lesson_duration_short" not in out
+
+
+def test_audit_binding_rejects_a_swapped_plan(tmp_path) -> None:
+    """A renamed or replaced plan must not inherit the old audit's clean bill."""
+
+    from doc_to_video_tutor.studio.util import atomic_json_write, file_digest
+    from doc_to_video_tutor.studio.validate import check_audit_binding
+
+    plan_p = tmp_path / "m.plan.json"
+    audit_p = tmp_path / "m.audit.json"
+    atomic_json_write(plan_p, {"plan": {"title": "original"}})
+    atomic_json_write(audit_p, {
+        "artifact_type": "plan_audit",
+        "plan_sha256": file_digest(plan_p),
+        "plan_filename": plan_p.name,
+    })
+    # The audit genuinely describes this plan.
+    assert check_audit_binding(plan_p, audit_p) == []
+
+    # Now swap the plan for different content, leaving the filename identical.
+    atomic_json_write(plan_p, {"plan": {"title": "tampered"}})
+    findings = check_audit_binding(plan_p, audit_p)
+    assert len(findings) == 1
+    assert "audit_plan_digest_mismatch" in findings[0]
+
+
+def test_audit_binding_flags_an_unbound_audit(tmp_path) -> None:
+    """An audit with no digest is reported, not assumed good."""
+    import json
+
+    from doc_to_video_tutor.studio.util import atomic_json_write
+    from doc_to_video_tutor.studio.validate import check_audit_binding
+
+    plan_p = tmp_path / "m.plan.json"
+    audit_p = tmp_path / "m.audit.json"
+    atomic_json_write(plan_p, {"plan": {}})
+    # The legacy shape: a path and nothing to tie it to content.
+    atomic_json_write(audit_p, {"plan": "somewhere/else.plan.json"})
+    findings = check_audit_binding(plan_p, audit_p)
+    assert findings and "audit_plan_digest_missing" in findings[0]
+    assert json.loads(audit_p.read_text())["plan"] == "somewhere/else.plan.json"

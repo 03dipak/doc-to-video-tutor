@@ -603,3 +603,70 @@ def test_profile_rules_is_safe_for_unknown_profile() -> None:
 
     assert _profile_rules({}) is None
     assert _profile_rules({"voice_profile": "no-such-voice"}) is None
+
+
+def test_write_webvtt_groups_words_and_advances_by_clip_duration(
+        tmp_path, monkeypatch) -> None:
+    """Captions must be readable phrases on the real timeline, not one word each."""
+    from pathlib import Path
+
+    from doc_to_video_tutor.studio import video
+
+    # Two clips; clip 1's last word ends at 1.0 s but the clip is 5.0 s long.
+    # Advancing on word offsets instead of clip duration would drop clip 2's
+    # cues back inside clip 1.
+    timings = [
+        [{"text": "alpha", "start": 0.1, "duration": 0.4},
+         {"text": "beta", "start": 0.6, "duration": 0.4}],
+        [{"text": "gamma", "start": 0.1, "duration": 0.4},
+         {"text": "delta", "start": 0.6, "duration": 0.4}],
+    ]
+    monkeypatch.setattr(video, "_clip_seconds", lambda _p: 5.0)
+    out = tmp_path / "cap"
+    cues = video._write_webvtt(out, {}, timings, [Path("a.mp3"), Path("b.mp3")],
+                              pause=3.0)
+    assert cues == 2
+    vtt = (tmp_path / "cap.vtt").read_text(encoding="utf-8")
+    assert vtt.startswith("WEBVTT\n")
+    assert "," not in vtt, "WebVTT uses a dot before milliseconds"
+    # Both words of a clip form one cue, not one cue per word.
+    assert "alpha beta" in vtt
+    # Clip 2 starts after clip 1's real duration plus the pause (5 + 3 = 8 s).
+    assert "00:00:08.100" in vtt
+    starts = [ln for ln in vtt.splitlines() if "-->" in ln]
+    assert len(starts) == 2
+
+
+def test_fused_particle_tokens_catches_real_fusion_without_false_positives() -> None:
+    """A lowercase particle+word fusion must not slip past the capital-only gate."""
+    from doc_to_video_tutor.studio.speech import _fused_particle_tokens
+
+    # "deterministic" is attested vocabulary elsewhere in the narration, which is
+    # what makes the split safe to report.
+    known = frozenset({"deterministic", "offline", "gate", "evaluation",
+                       "reason", "yahi", "hai"})
+    spoken = ("Is scene mein hum ek fresh concept samjhenge. Reason yahi hai "
+              "kideterministic offline gate vs live evaluation because the gate "
+              "runs a fully deterministic evaluator.")
+    assert _fused_particle_tokens(spoken, known) == {
+        "kideterministic": "ki deterministic"}
+
+    # Ordinary English that splits attractively must stay clean, otherwise the
+    # rule cries wolf on every technical lesson.
+    for clean in ("We killed the stale cache and together we shipped it.",
+                  "The takeaway is deterministic and reproducible.",
+                  "Keep the cache warm and the latency low."):
+        assert _fused_particle_tokens(clean, known) == {}, clean
+
+    # A token whose tail is NOT attested is not a fusion we can claim.
+    assert _fused_particle_tokens("Reason yahi hai kizarbitrary.", known) == {}
+
+
+def test_fusion_is_reported_as_a_warning_not_an_audit_failure() -> None:
+    """Below the auto-repair bar the finding must surface, not mutate the script."""
+    from doc_to_video_tutor.studio.speech import TtsFinding, _fused_particle_tokens
+
+    assert TtsFinding("tts_token_fusion", "WARN", "x").severity == "WARN"
+    # And the rule itself never rewrites text: it only reports a candidate split.
+    known = frozenset({"deterministic"})
+    assert _fused_particle_tokens("kideterministic", known)

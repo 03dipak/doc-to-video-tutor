@@ -75,3 +75,29 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.coverage.run]
+source = ["src/doc_to_video_tutor/studio"]
+branch = false
+# Entry point only; the dispatch itself is covered by invoking the CLI.
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+# A single total across this tree is close to meaningless, because it averages
+# two unrelated kinds of code: deterministic gate logic, which is pure and
+# cheap to test (narration 89%, speech 95%, config 100%), against orchestration
+# that needs a live provider, ffmpeg, fonts and moviepy (cli 9%, llm 22%,
+# slides 27%). Gating on the raw total punishes the second kind for not being
+# unit-testable while barely noticing the first kind rotting.
+#
+# So the floor is set against the measured baseline and the CI job reports the
+# full table, leaving the per-module trend visible. Raising this number should
+# mean new tests on gate logic, not mocks of argparse wiring.
+fail_under = 58
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]

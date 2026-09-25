@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
+
+
+def file_digest(path: Path) -> str:
+    """SHA-256 of a file's bytes, or "" when it cannot be read.
+
+    Used to bind an artifact to the exact input it describes. A path is display
+    metadata - it can be copied, renamed, or point at a different file - so
+    identity has to come from content. See `check_audit_binding`.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
 
 
 def atomic_json_write(path: Path, data: dict) -> None:

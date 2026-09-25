@@ -34,6 +34,7 @@ from .topics import (
     _plan_is_on_topic,
     _topic_coverage_problem,
 )
+from .util import file_digest
 from .voice import NarrationVoice, _make_voice
 
 
@@ -175,6 +176,40 @@ def _narration_has_content(nar: str, title: str) -> bool:
     content = [w for w in tokens
                if w not in title_words and w not in _TRANSITION_FILLER]
     return len(content) >= 3 and len(content) / len(tokens) >= 0.4
+def check_audit_binding(plan_path: Path, audit_path: Path) -> list[str]:
+    """Verify an audit artifact describes the plan sitting beside it.
+
+    An audit is only evidence if it is bound to the exact bytes it audited. The
+    previous audit recorded `plan: str(src)` - the *input* path - while shipping
+    beside the *repaired* plan, so nothing tied the two together and a renamed or
+    replaced file inherited the audit's clean bill of health. The digest is the
+    identity; the path is display metadata and is never trusted for that.
+
+    Returns a list of findings; empty means the audit is bound correctly. An
+    audit with no digest at all is reported rather than assumed good, because
+    silently accepting an unbound audit would defeat the point of the check.
+    """
+    findings: list[str] = []
+    try:
+        audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"audit unreadable: {exc}"]
+    recorded = str(audit.get("plan_sha256") or "")
+    if not recorded:
+        findings.append("audit_plan_digest_missing: the audit carries no "
+                        "plan_sha256, so it cannot be tied to any plan")
+        return findings
+    actual = file_digest(Path(plan_path))
+    if not actual:
+        findings.append(f"audit_plan_unreadable: cannot digest {plan_path}")
+    elif actual != recorded:
+        findings.append(
+            f"audit_plan_digest_mismatch: the audit was written for a different "
+            f"plan than the one beside it (recorded {recorded[:12]}..., on disk "
+            f"{actual[:12]}...); the audit does not describe this plan")
+    return findings
+
+
 def _render_blocking_problems(plan: dict,
                               voice: NarrationVoice | None = None,
                               protected: frozenset[str] | None = None

@@ -38,8 +38,8 @@ from .text import (
     _strip_source_metadata_blocks,
     _top_source_terms,
 )
-from .util import _wait_before_retry, atomic_json_write, load_documents
-from .validate import _render_blocking_problems, guard_plan, review_plan
+from .util import _wait_before_retry, atomic_json_write, file_digest, load_documents
+from .validate import _render_blocking_problems, check_audit_binding, guard_plan, review_plan
 from .video import _render_media
 from .voice import _make_voice, _voice_fingerprint
 
@@ -333,6 +333,15 @@ def main(argv: list[str] | None = None) -> None:
                 [str(s.get("narration", "")) for s in again.get("scenes", [])]
                 != [str(s.get("narration", "")) for s in plan.get("scenes", [])])
         audit = {
+            "artifact_type": "plan_audit",
+            "audit_schema_version": 1,
+            # Identity is the digest of the file this audit actually describes -
+            # the repaired plan that ships beside it. `plan` is kept as display
+            # metadata only: it is the input path, and a path can be renamed or
+            # point at a different file, so it can never stand in for identity.
+            "plan_sha256": file_digest(out_p),
+            "plan_filename": out_p.name,
+            "source_plan": str(src),
             "plan": str(src),
             "voice": voice.name,
             "protected_trigrams": sorted(protected),
@@ -346,6 +355,9 @@ def main(argv: list[str] | None = None) -> None:
             "idempotent": not _still_changes,
         }
         audit_p = out_p.with_name(f"{out_p.stem}.audit.json")
+        # An audit is only evidence if it is bound to the plan beside it, so a
+        # stale or swapped plan cannot inherit a clean bill of health.
+        binding = check_audit_binding(out_p, audit_p) if audit_p.exists() else []
         print(f"Verify {src}")
         print(f"  title     : {plan.get('title')!r}")
         print(f"  voice     : {voice.name}")
@@ -366,6 +378,7 @@ def main(argv: list[str] | None = None) -> None:
         hard = [p for p in verify_problems
                 if not any(p.startswith(s) for s in _SOFT_PREFIXES)]
         hard += _render_blocking_problems(plan, voice=voice)
+        hard += list(binding)
         soft = [p for p in verify_problems
                 if any(p.startswith(s) for s in _SOFT_PREFIXES)]
         if hard:
@@ -395,6 +408,10 @@ def main(argv: list[str] | None = None) -> None:
         if hard or audio_fails:
             sys.exit(1)
         atomic_json_write(out_p, data)
+        # Digest the plan *after* it lands, so the audit is bound to the exact
+        # bytes on disk rather than to an in-memory object that write() may
+        # still reshape.
+        audit["plan_sha256"] = file_digest(out_p)
         atomic_json_write(audit_p, audit)
         if not hard:
             print(f"  fixed plan written to {out_p}")

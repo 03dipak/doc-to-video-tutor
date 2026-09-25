@@ -215,6 +215,49 @@ def _spoken_variant(voice: NarrationVoice, written: str) -> str:
     return text
 
 
+_HINDI_PARTICLES = ("ki", "ka", "ke", "ko", "se", "aur", "par", "vala",
+                    "wali", "mein", "to", "tak", "bhi", "hi")
+
+
+def _fused_particle_tokens(spoken: str, known: frozenset[str]) -> dict[str, str]:
+    """Lowercase tokens that are a Hindi particle fused onto an English word.
+
+    `tts_unknown_token` only inspects capitalised tokens, so a lowercase fusion
+    is invisible to it. The real lesson contained "kideterministic" - the model
+    wrote it, the source never contained it, and four repair passes preserved it
+    verbatim, because nothing in the pipeline looks at unknown lowercase tokens.
+
+    Detection is deliberately narrow, because a general "unknown token" rule
+    floods technical narration with false positives. Both halves must be
+    independently attested, which is what makes it safe:
+
+      1. the whole token is NOT known vocabulary, so it cannot be a real domain
+         term that merely looks fused;
+      2. some prefix is a known Hindi/Hinglish particle;
+      3. the remaining suffix IS known vocabulary, i.e. a word the plan itself
+         uses elsewhere. A fusion leaves a tail that the narrator went on to
+         pronounce normally ("...kideterministic..." then "fully deterministic").
+
+    Condition 3 is the load-bearing one. Without it, "killed" and "together"
+    split attractively and the rule cries wolf on ordinary English.
+
+    Returns {fused_token: "particle suffix"}; empty when nothing qualifies.
+    """
+    out: dict[str, str] = {}
+    for raw in spoken.split():
+        bare = raw.strip(".,;:!?()[]{}\"'“”").casefold()
+        if len(bare) < 8 or bare in known:
+            continue
+        for particle in _HINDI_PARTICLES:
+            if not bare.startswith(particle):
+                continue
+            suffix = bare[len(particle):]
+            if len(suffix) >= 5 and suffix in known:
+                out[bare] = f"{particle} {suffix}"
+                break
+    return out
+
+
 def _word_count(text: str) -> int:
     return len(str(text).split())
 
@@ -308,6 +351,13 @@ def audit_tts_script(clips: list[dict], voice: NarrationVoice,
                 "tts_unknown_token", "FAIL",
                 f"{tag} unexplained token not in title/source/glossary: "
                 f"{', '.join(sorted(unknown))}"))
+        fused = _fused_particle_tokens(spoken, known)
+        if fused:
+            findings.append(TtsFinding(
+                "tts_token_fusion", "WARN",
+                f"{tag} token(s) look like a Hindi particle fused onto an "
+                f"English word, absent from the source: "
+                f"{', '.join(f'{k} -> {v}' for k, v in sorted(fused.items()))}"))
         if role == "final":
             continue
         wc = _word_count(spoken)
