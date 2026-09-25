@@ -637,3 +637,72 @@ def test_deck_page_counters_are_correct() -> None:
             if text.endswith(f"/ {total}") and shape.width / 914400.0 < 2:
                 assert text == f"{index} / {total}", (
                     f"slide {index} prints {text!r}")
+
+
+# --- the pipeline must not promise to continue it will refuse ------------
+#
+# Observed on mod03_gates_v012_008. The plan stage collected "repeating
+# narration phrase" as a soft problem and printed
+#   "WARNING: repeating narration phrase detected ... proceeding anyway"
+# and the pre-render gate then refused the same plan on the same condition:
+#   "RENDER-BLOCKING: 1 banned narration phrase(s) unresolved"
+# 40 seconds and a full TTS run later. One defect, two severities, and the user
+# was told the first and blocked by the second.
+#
+# The refusal itself is correct - the narration really did repeat a trigram
+# across a fragment join. The defect was the false reassurance, not the gate.
+
+def test_render_blocking_conditions_are_not_reported_as_proceeding() -> None:
+    """A condition the render gate will refuse must not be called advisory."""
+    import json
+    from pathlib import Path
+
+    from doc_to_video_tutor import studio as S
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import _render_blocking_problems
+
+    rejected = Path("output/mod03_gates_v012_008.plan.json")
+    if not rejected.exists():
+        import pytest
+
+        pytest.skip("rejected artifact not present; run the build first")
+
+    doc = json.loads(rejected.read_text(encoding="utf-8"))
+    voice = S._make_voice(doc.get("voice"))
+    blocking = _render_blocking_problems(doc["plan"], voice=voice)
+    assert blocking, "this plan is the one the gate refused"
+
+    # The soft prefix list is what let the plan stage call it advisory.
+    assert "repeating narration phrase" in _SOFT_PREFIXES
+
+    # And the gate's own finding is genuinely render-blocking, not advisory.
+    assert any("RENDER-BLOCKING" in b for b in blocking)
+
+
+def test_the_repeated_trigram_spans_a_fragment_join() -> None:
+    """The refusal was correct: the narration really is repetitive.
+
+    The phrase is `consistent verdicts units` - the tail of the design decision
+    ("...critical for consistent verdicts.") followed by the head of the next
+    fragment ("Units define 'too much'"). A trigram spanning a join is invisible
+    to a per-fragment check, which is why the repair chain left it and the
+    render gate caught it.
+    """
+    import json
+    from pathlib import Path
+
+    import pytest
+
+    from doc_to_video_tutor.studio.text import _nar_tokens
+
+    rejected = Path("output/mod03_gates_v012_008.plan.json")
+    if not rejected.exists():
+        pytest.skip("rejected artifact not present; run the build first")
+    plan = json.loads(rejected.read_text(encoding="utf-8"))["plan"]
+    target = ("consistent", "verdicts", "units")
+    scenes = [i for i, sc in enumerate(plan["scenes"], 1)
+              if any(tuple(_nar_tokens(str(sc.get("narration", "")))[k:k + 3])
+                     == target
+                     for k in range(max(len(_nar_tokens(
+                         str(sc.get("narration", "")))) - 2, 0)))]
+    assert scenes == [4], f"expected the repeat in scene 4 only, got {scenes}"

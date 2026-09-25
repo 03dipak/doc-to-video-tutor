@@ -1842,8 +1842,29 @@ def plan_lesson(content: str, target_minutes: float,
     if _section_problems(plan):
         problems.append("section label = full enum (not a single section)")
     if problems:
-        print(f"WARNING: {' + '.join(problems)} after one retry; proceeding anyway. "
-              f"({elapsed:.0f}s)", flush=True)
+        # Do not promise to continue when the pre-render gate is going to
+        # refuse. `repeating narration phrase` is soft at this stage - it only
+        # decides whether to resample the plan - and hard at the render gate, so
+        # the same condition was reported as "proceeding anyway" and then killed
+        # the build 40 seconds later. One defect, two severities, and the user was
+        # told the first and blocked by the second. Observed on
+        # mod03_gates_v012_008.
+        #
+        # The plan is still written, because a rejected plan plus its audit is
+        # the artifact `verify` needs to repair it, so the message says exactly
+        # that rather than implying nothing was produced.
+        from .validate import _render_blocking_problems
+
+        blocking = _render_blocking_problems(plan, voice=voice,
+                                             protected=protected)
+        if blocking:
+            print("BLOCKING: the pre-render gate will refuse this plan "
+                  f"({'; '.join(blocking[:2])}). The plan and its audit are "
+                  f"written for repair; no media will be produced. "
+                  f"({elapsed:.0f}s)", flush=True)
+        else:
+            print(f"WARNING: {' + '.join(problems)} after one retry; "
+                  f"proceeding anyway. ({elapsed:.0f}s)", flush=True)
     else:
         print(f"\u2713  ({elapsed:.0f}s)", flush=True)
     return plan, topics
