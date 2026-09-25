@@ -810,8 +810,8 @@ Two residual warnings remain from the same re-review, neither a regression:
 | 6 | Badge chip text is 15 pt, below the 18 pt body floor | **CLOSED** — raised to 16 pt with a wider box, and the chip gutter widened 0.12 → 0.20 in so `4 CONFIG ERR` stays on one line and the red/green pair no longer vibrates |
 | 8 | Column fill averages 61 %, bottom whitespace ranges 0.83–2.72 in across content slides | Matches the "unused space" complaint in §19.4 |
 | 9 | Paginated scenes repeat the same header on each page with no continuation marker | Add a "continued" affordance when a scene spans pages |
-| 10 | Spoken word count outside 25–65 on two clips (78 and 20) | Our own gate treats these as WARN; the reviewer treats the band as FAIL — §12 and the reviewer checklist must state one authoritative threshold |
-| 11 | Reviewer checklist still asserts a 5–8 scene band, which conflicts with the concept-driven frame (up to 12) | §10.1 is authoritative; the checklist range is stale |
+| 10 | Spoken word count outside 25–65 on two clips (78 and 20) | **CLOSED** — the 25–65 band was the defect, not the clips. The code gate in §9.1 is authoritative (FAIL < 20 or > 90, WARN < 25 or > 70); the reviewer checklist now defers to it, so 78 is correctly a WARN. Recorded in §22.2 |
+| 11 | Reviewer checklist still asserts a 5–8 scene band, which conflicts with the concept-driven frame (up to 12) | **CLOSED** — the checklist now requires equality with the plan's own `scene_target` and cites the 5–12 concept frame; the fixed 5–8 rule is gone. Recorded in §22.2 |
 | 12 | A saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | Provenance should name the file it describes |
 
 ### 20.3 Verified good in the same review
@@ -828,7 +828,7 @@ off-canvas.
 
 ## 21. Appendix
 
-### 19.1 Artifact set
+### 21.1 Artifact set
 
 | Artifact | Contents |
 |---|---|
@@ -844,7 +844,7 @@ off-canvas.
 | `<name>.pptx` | Lesson deck |
 | `<name>.mp4` | Rendered video |
 
-### 19.2 Glossary
+### 21.2 Glossary
 
 | Term | Meaning |
 |---|---|
@@ -969,7 +969,7 @@ pipeline rather than improving it.
 | **M2** | Pygments colouring; scoped uniform `zoompan`; SVG diagram backend only | deck and video stay in agreement; no slide shorter than its audio |
 | **Hold** | avatars, model-based grounding, Mermaid-CLI, Manim, Whisper family, full renderer rewrite | only reopened with new evidence |
 
-### 22.4 Milestone status
+### 22.5 Milestone status
 
 M0 and the M1/M2 items below are implemented and verified against
 `mod03_gates_v021`; the remainder is open. "Verified" means exercised by a real
