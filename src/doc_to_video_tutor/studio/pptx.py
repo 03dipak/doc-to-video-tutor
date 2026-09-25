@@ -254,7 +254,8 @@ def _strip_field_leak(text: str) -> str:
 
 
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
-                 bold=False, wrap=True, font_name: str = "Arial"):
+                 bold=False, wrap=True, font_name: str = "Arial",
+                 bullet: bool = False):
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
 
@@ -268,6 +269,15 @@ def _ppt_textbox(slide, left, top, width, height, text, size, color,
     p.font.size = Pt(size)
     p.font.bold = bold
     p.font.color.rgb = RGBColor(*color)
+    if bullet:
+        # Format paragraph 0 in place. The alternative - writing a placeholder
+        # and then calling _ppt_para, which does add_paragraph() - left every
+        # bullet box rendering TWO paragraphs: a blank line and then the text.
+        # The reserved height was measured for the text alone, so each bullet
+        # under-reserved by one 18pt line (~0.31in) and its text spilled into
+        # whatever the stack placed next. Measured on mod03_gates_v012_010: a
+        # 0.71in box whose content actually needs 1.02in.
+        _ppt_bullet(p)
     return tb
 def _ppt_codebox(slide, left, top, width, lines, context=""):
     """Monospace (Courier New) code panel on a slide."""
@@ -353,7 +363,11 @@ def _ppt_slide_chrome(slide, section: str, title: str, counter: str,
     # The cap trims on a word boundary, so the frame never shows a half word.
     # Width stops short of the counter at x=11.20. At 11.0in the title box ran
     # to 11.42 and overlapped the page number by 0.22in on every content slide.
-    _ppt_textbox(slide, 0.42, 0.62, 10.6, 0.62, clip_title(title), 32,
+    # Height is measured too: at 32pt a single line needs 0.64in and the box was
+    # a flat 0.62in, a 0.02in under-reservation of its own.
+    shown = clip_title(title)
+    title_h = _est_text_height(shown, 10.6, 32)
+    _ppt_textbox(slide, 0.42, 0.62, 10.6, title_h, shown, 32,
                  (255, 255, 255), bold=True)
 
     div = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
@@ -515,9 +529,8 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             at = stack.reserve(need, _RowStack.REQUIRED, f"bullet {b[:24]}")
             if at is None:
                 break  # required content is out of room; stop, never clip
-            tb = _ppt_textbox(s, 0.52, at, 12.3, need, " ", 18, (235, 238, 245))
-            tf = tb.text_frame
-            _ppt_para(tf, b, 18, (235, 238, 245), bullet=True)
+            _ppt_textbox(s, 0.52, at, 12.3, need, b, 18, (235, 238, 245),
+                         bullet=True)
             y = stack.y
 
         if scene.get("status_badges") and "status_badges" in _video_blocks(scene):
@@ -710,9 +723,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 col = 0 if (col_tops[0] + need <= top + budget) else 1
                 take = pending.pop(0)
                 _ppt_textbox(s, col_x[col], col_tops[col], col_width, need,
-                             " ", 18, (235, 238, 245))
-                tb = s.shapes[-1]
-                _ppt_para(tb.text_frame, take, 18, (235, 238, 245), bullet=True)
+                             take, 18, (235, 238, 245), bullet=True)
                 col_tops[col] += need + 0.12
                 placed_here += 1
             if not placed_here:
@@ -721,10 +732,8 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 take = pending.pop(0)
                 need = min(max(0.5, _est_text_height(take, col_width - 0.25, 18)),
                            budget)
-                _ppt_textbox(s, col_x[0], top, col_width, need, " ", 18,
-                             (235, 238, 245))
-                tb = s.shapes[-1]
-                _ppt_para(tb.text_frame, take, 18, (235, 238, 245), bullet=True)
+                _ppt_textbox(s, col_x[0], top, col_width, need, take, 18,
+                             (235, 238, 245), bullet=True)
                 # `deck_total` is a count of slides, not this slide's index, and
                 # with takeaway pagination they differ. Use the same arithmetic
                 # as the counter: title + scene slides + this takeaway page.
@@ -774,8 +783,15 @@ def _audit_layout(out_path: Path) -> list[str]:
         for sh in shapes:
             if not sh.has_text_frame:
                 continue
-            text = sh.text_frame.text.strip()
-            if not text:
+            # Measure the frame as it will render: every paragraph, not
+            # `.text.strip()`. Stripping collapsed a leading blank paragraph
+            # out of the measurement, so a box that rendered two lines inside a
+            # one-line frame measured as fitting. The placeholder-then-append
+            # pattern that created those blanks is gone, so this no longer hides
+            # a live defect - but measuring the real structure is what stops the
+            # next one from hiding here.
+            text = "\n".join(par.text for par in sh.text_frame.paragraphs)
+            if not text.strip():
                 continue
             size = 17.0
             for para in sh.text_frame.paragraphs:

@@ -984,3 +984,94 @@ def test_a_forced_note_names_the_slide_that_actually_carries_it(tmp_path) -> Non
         assert 1 <= number <= total, (
             f"note names slide {number}, but the deck has {total} slides: "
             f"{line.strip()}")
+
+
+# --- a bullet box must render exactly one paragraph ----------------------
+#
+# Found by external review and confirmed here. Every bullet and takeaway box was
+# written as a placeholder paragraph and then filled by _ppt_para, which calls
+# tf.add_paragraph() - so the frame rendered TWO paragraphs: a blank line, then
+# the text. The height reserved in the row stack was measured for the text
+# alone, so each bullet under-reserved by one 18pt line (~0.31in) and its text
+# spilled into whatever the stack placed next. Measured on
+# mod03_gates_v012_010: a 0.71in box whose content actually needed 1.02in.
+#
+# The audit could not see it either, for a slightly different reason than
+# expected: _audit_layout measured `text_frame.text.strip()`, and stripping
+# deletes the leading blank line, so the frame measured as fitting. Both the
+# layout and the checker were blind, in the same direction.
+
+def test_a_bullet_box_renders_exactly_one_paragraph(tmp_path) -> None:
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    plan = {"title": "T", "takeaways": ["a durable conclusion worth keeping "
+                                       "at a length that wraps onto a second "
+                                       "line so the box has to grow"],
+            "scenes": [{"section": "S", "title": "One", "topic": "t",
+                        "narration": "n" * 40, "source_refs": ["s"],
+                        "bullets": ["A bullet long enough to wrap onto a "
+                                    "second line at eighteen point type."]}]}
+    out = Path(tmp_path) / "deck.pptx"
+    build_pptx(plan, out)
+    multi = [(i, len(sh.text_frame.paragraphs))
+             for i, slide in enumerate(Presentation(str(out)).slides, 1)
+             for sh in slide.shapes
+             if sh.has_text_frame and len(sh.text_frame.paragraphs) > 1]
+    assert not multi, f"frames rendering a blank leading paragraph: {multi}"
+
+
+def test_reserved_height_covers_the_rendered_paragraphs(tmp_path) -> None:
+    """The stack's estimate and the frame's real content must agree."""
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import _est_text_height, build_pptx
+
+    emu = 914400.0
+    plan = {"title": "T", "takeaways": [], "scenes": [{
+        "section": "S", "title": "One", "topic": "t", "narration": "n" * 40,
+        "source_refs": ["s"],
+        "bullets": ["A bullet that is long enough to wrap onto a second line "
+                    "at eighteen point type in a twelve inch column."]}]}
+    out = Path(tmp_path) / "deck.pptx"
+    build_pptx(plan, out)
+    for slide in Presentation(str(out)).slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame or not shape.text_frame.text.strip():
+                continue
+            text = "\n".join(p.text for p in shape.text_frame.paragraphs)
+            size = 18.0
+            for para in shape.text_frame.paragraphs:
+                if para.font.size is not None:
+                    size = para.font.size.pt
+                    break
+            need = _est_text_height(text, shape.width / emu, size)
+            assert need <= shape.height / emu + 0.02, (
+                f"reserves {shape.height / emu:.2f}in, renders {need:.2f}in")
+
+
+def test_audit_does_not_strip_paragraph_structure() -> None:
+    import tempfile
+    """A frame with a blank leading paragraph must not measure as fitting."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+
+    from doc_to_video_tutor.studio.pptx import _audit_layout
+
+    out = Path(tempfile.mkdtemp()) / "blank.pptx"
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(0.3))
+    box.text_frame.word_wrap = True
+    box.text_frame.paragraphs[0].text = " "
+    box.text_frame.paragraphs[0].font.size = Pt(18)
+    para = box.text_frame.add_paragraph()
+    para.text = "and here is the real content that needs a second line of room"
+    para.font.size = Pt(18)
+    prs.save(str(out))
+    findings = _audit_layout(out)
+    assert any("overflows" in f for f in findings), (
+        "a blank leading paragraph must count towards the rendered height")

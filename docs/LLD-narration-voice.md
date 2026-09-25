@@ -1140,3 +1140,41 @@ The general rule this exposes: a diagnostic that names a location is only useful
 if the location is derived from the same source of truth as the thing it
 describes. `deck_total` was a plausible-looking number that meant something else,
 and no amount of reading the message would have revealed that.
+
+### 22.10 Every rendered paragraph must be inside the box that was measured for it
+
+Found by external review, confirmed here, and it is the root cause behind the
+thin-but-wide overlaps seen on slide 9 of `mod03_gates_v012_010`.
+
+Every bullet and takeaway box was written as a placeholder paragraph and then
+filled by `_ppt_para`, which calls `tf.add_paragraph()`. So each frame rendered
+**two** paragraphs — a blank line, then the text — while the height reserved in
+`_RowStack` was measured for the text alone. Each bullet therefore under-reserved
+by one 18 pt line, about **0.31 in**, and the text spilled into whatever the
+stack placed next. Measured: a 0.71 in box whose content actually needed 1.02 in.
+
+The reported geometry corroborates it. The overlaps were 0.37–0.40 in tall —
+one 18 pt line plus insets — and 8.30 in and 12.10 in wide, which are exactly the
+intersections of a full-width content box with the 8.5 in footer and with a
+sibling content box.
+
+Two things made this invisible, and the second is the more interesting:
+
+1. The overlap check compares boxes, and a correctly sized box containing
+   overflowing text overlaps nothing.
+2. `_audit_layout` measured `text_frame.text.strip()`. Stripping **deletes** the
+   leading blank line, so a two-line frame measured as one line and reported as
+   fitting. The estimator and the checker were blind in the same direction, which
+   is why the deck passed repeatedly.
+
+Fixed as a class rather than per call site: `_ppt_textbox` takes a `bullet`
+argument and formats paragraph 0 in place, retiring the placeholder-then-append
+pattern at all three sites. The audit now measures the frame as it will render,
+joining the real paragraphs rather than stripping them.
+
+Chasing this also surfaced a 0.02 in under-reservation in the slide title: at
+32 pt a single line needs 0.64 in and the box was a flat 0.62 in. Now measured.
+
+The general rule: **a checker that normalises away the very structure it is
+checking cannot detect it.** `strip()` is the right call for comparing content
+and the wrong call for comparing geometry.
