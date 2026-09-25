@@ -534,3 +534,106 @@ def test_diagram_dedup_is_token_based_not_string_based() -> None:
     ]}
     assert _dedupe_visual_diagrams(plan) == 1
     assert "visual_diagram" not in plan["scenes"][1]
+
+
+# --- takeaway cards flowed by measured height, not a fixed row step -------
+#
+# Observed on slide 11 of mod03_gates_v012_007: three overlaps 5.90in wide,
+# which is a full column. The takeaway block advanced every card by a constant
+# 1.2in while sizing the card from a character-count guess
+# (`1.2 * (0.5 + len/100)`), so any card taller than 1.2in overlapped the next
+# one in its column. This is the same defect already fixed for scene bullets,
+# in a code path the layout audit had never been run against - the earlier decks
+# passed because their takeaways happened to be short.
+
+def test_long_takeaways_do_not_overlap_each_other() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from doc_to_video_tutor.studio.pptx import _audit_layout, build_pptx
+
+    plan = {
+        "title": "T",
+        "scenes": [{"section": "S", "title": "One", "topic": "t",
+                    "narration": "n" * 40, "source_refs": ["s"],
+                    "bullets": ["short one"]}],
+        "takeaways": [f"Takeaway {i}: " + ("a durable conclusion stated at "
+                      "real length so the card cannot fit one row. " * 3)
+                      for i in range(6)],
+    }
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    build_pptx(plan, out)
+    findings = _audit_layout(out)
+    assert [f for f in findings if "overlap" in f] == [], findings
+
+
+def test_long_takeaways_paginate_instead_of_being_dropped() -> None:
+    """The summary slide must not lose content to protect the layout.
+
+    Overflow becomes another slide - the same rule already applied to bullets.
+    Before this, eight 288-character takeaways filled two columns and dropped
+    four, which is the wrong trade on the most important slide in the deck.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    plan = {
+        "title": "T",
+        "scenes": [{"section": "S", "title": "One", "topic": "t",
+                    "narration": "n" * 40, "source_refs": ["s"],
+                    "bullets": ["b"]}],
+        "takeaways": [f"Takeaway {i}: " + ("a real conclusion. " * 12)
+                      for i in range(8)],
+    }
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    build_pptx(plan, out)
+    prs = Presentation(str(out))
+    # Match on content AND geometry: the "Key Takeaways" chrome label also
+    # contains the word, and counting it hides whether cards were placed.
+    placed = sum(1 for slide in prs.slides for shape in slide.shapes
+                 if shape.has_text_frame
+                 and "Takeaway " in shape.text_frame.text
+                 and shape.width / 914400.0 > 5
+                 and shape.top / 914400.0 > 1.5)
+    assert placed == 8, f"only {placed}/8 takeaway cards placed"
+    # More than one takeaway slide means it paginated rather than truncated.
+    labels = [shape.text_frame.text for slide in prs.slides
+              for shape in slide.shapes if shape.has_text_frame
+              and "Key Takeaways" in shape.text_frame.text
+              and shape.width / 914400.0 > 5]
+    assert len(labels) >= 2, "eight long takeaways should need continuation"
+
+
+def test_deck_page_counters_are_correct() -> None:
+    """A paginating deck must still print an honest N / total on every slide."""
+    import tempfile
+    from pathlib import Path
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    plan = {
+        "title": "T",
+        "scenes": [{"section": "S", "title": f"Scene {i}", "topic": "t",
+                    "narration": "n" * 40, "source_refs": ["s"],
+                    "bullets": ["b"]} for i in range(3)],
+        "takeaways": [f"Takeaway {i}: " + ("a real conclusion. " * 12)
+                      for i in range(6)],
+    }
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    build_pptx(plan, out)
+    prs = Presentation(str(out))
+    total = len(prs.slides._sldIdLst)
+    for index, slide in enumerate(prs.slides, 1):
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            text = shape.text_frame.text.strip()
+            if text.endswith(f"/ {total}") and shape.width / 914400.0 < 2:
+                assert text == f"{index} / {total}", (
+                    f"slide {index} prints {text!r}")

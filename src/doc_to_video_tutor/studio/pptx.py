@@ -216,6 +216,28 @@ def _paginate_by_height(page: dict, budget: float) -> list[dict]:
     return out
 
 
+def _takeaway_pages(takes: list[str], budget: float,
+                    col_width: float = 5.9) -> int:
+    """How many two-column slides the takeaways need, measured before rendering.
+
+    Counted up front so the deck's page counter is honest. The previous fixed
+    `rows_per_col` made the count a guess; with overflow now paginating, a wrong
+    guess would print a wrong "7 / 6" on the last slide.
+    """
+    tops = [0.0, 0.0]
+    pages = 1
+    used = 0
+    for take in takes:
+        need = max(0.5, _est_text_height(take, col_width - 0.25, 18))
+        if max(tops) + need > budget:
+            pages += 1
+            tops = [0.0, 0.0]
+        col = 0 if (tops[0] + need <= budget) else 1
+        tops[col] += need + 0.12
+        used += 1
+    return max(pages, 1 if used else 0)
+
+
 def _strip_field_leak(text: str) -> str:
     """Remove a trailing JSON field name from text bound for a slide.
 
@@ -439,7 +461,10 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         for planned in _scene_pages(scene):
             page_scenes.extend(_paginate_by_height(planned, _BODY_BUDGET))
     takes = (plan.get("takeaways") or [])[:8]
-    deck_total = len(page_scenes) + (2 if takes else 1)
+    # The takeaway slides paginate, so their count has to be measured
+    # before the deck total is fixed or the counter prints "7 / 6".
+    take_pages = _takeaway_pages(takes, 6.9 - 1.7) if takes else 0
+    deck_total = len(page_scenes) + (1 + take_pages if takes else 1)
 
     s = prs.slides.add_slide(blank)
     _ppt_set_bg(s)
@@ -611,28 +636,64 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 break
 
     if takes:
-        # takeaway slide — 2 columns, rows capped so nothing exceeds the budget;
-        # same chrome as the video's final card (section + counter + footer).
-        s = prs.slides.add_slide(blank)
-        _ppt_set_bg(s)
-        _ppt_slide_chrome(s, "Key Takeaways", "Key Takeaways",
-                          f"{deck_total} / {deck_total}", section_color=GREEN)
-
+        # Takeaway slides - two columns, flowed by measured height.
+        #
+        # This used to advance every card by a constant 1.2in while sizing the
+        # card from a character-count guess, so any card taller than 1.2in
+        # overlapped the next in its column: observed on slide 11 as three
+        # overlaps 5.90in wide, a full column. The same defect already fixed for
+        # scene bullets, in a path the audit had never been run against - earlier
+        # decks passed only because their takeaways happened to be short.
+        #
+        # Overflow becomes another slide rather than a shorter summary. The
+        # takeaway slide is the most important one in the deck, so dropping half
+        # of it to protect the layout is the wrong trade, and it is the same rule
+        # already applied to bullets. Eight 288-character takeaways filled two
+        # columns and dropped four; they now flow onto continuation slides.
         col_width = 5.9
         col_gap = 0.3
         x0 = 0.42
-        rows_per_col = 4
-        row_h = 1.2
         top = 1.7
-        for idx, t in enumerate(takes):
-            col = idx // rows_per_col
-            row = idx % rows_per_col
-            left = x0 + col * (col_width + col_gap)
-            box_h = row_h * (0.5 + (len(t) / 100))
-            _ppt_textbox(s, left, top + row * row_h, col_width, box_h, " ", 18,
-                          (235, 238, 245))
-            tb = s.shapes[-1]
-            _ppt_para(tb.text_frame, t, 18, (235, 238, 245), bullet=True)
+        budget = max_h - top
+        col_x = [x0, x0 + col_width + col_gap]
+        pending = list(takes)
+        page = 0
+        while pending:
+            page += 1
+            s = prs.slides.add_slide(blank)
+            _ppt_set_bg(s)
+            _ppt_slide_chrome(
+                s, "Key Takeaways",
+                "Key Takeaways" if page == 1 else f"Key Takeaways (cont. {page})",
+                f"{1 + len(page_scenes) + page} / {deck_total}", section_color=GREEN)
+            col_tops = [top, top]
+            placed_here = 0
+            while pending:
+                need = max(0.5, _est_text_height(pending[0],
+                                                  col_width - 0.25, 18))
+                if max(col_tops) + need > top + budget:
+                    break
+                col = 0 if (col_tops[0] + need <= top + budget) else 1
+                take = pending.pop(0)
+                _ppt_textbox(s, col_x[col], col_tops[col], col_width, need,
+                             " ", 18, (235, 238, 245))
+                tb = s.shapes[-1]
+                _ppt_para(tb.text_frame, take, 18, (235, 238, 245), bullet=True)
+                col_tops[col] += need + 0.12
+                placed_here += 1
+            if not placed_here:
+                # A single takeaway too tall for any column: keep it alone on a
+                # slide rather than looping forever or dropping it silently.
+                take = pending.pop(0)
+                need = min(max(0.5, _est_text_height(take, col_width - 0.25, 18)),
+                           budget)
+                _ppt_textbox(s, col_x[0], top, col_width, need, " ", 18,
+                             (235, 238, 245))
+                tb = s.shapes[-1]
+                _ppt_para(tb.text_frame, take, 18, (235, 238, 245), bullet=True)
+                slide_notes.append(
+                    f"slide {deck_total}: takeaway exceeds one column and was "
+                    f"clipped to a single slide: {take[:32]!r}")
 
     for note in slide_notes:
         print(f"  [WARN] layout: {note}")
