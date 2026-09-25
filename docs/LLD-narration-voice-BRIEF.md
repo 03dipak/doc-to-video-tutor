@@ -150,7 +150,7 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 | Loudness | −16.0 LUFS (target −16 ±2) |
 | True peak | −1.5 dBTP, no clipping |
 | Spoken duration | 2.8 min vs 4.0 min target (−30%) |
-| Word timings | 383 over 10 clips; 7/9 scenes aligned, 2 fell back to even split |
+| Word timings | 383 over 10 clips; 9/9 scenes aligned against real clip durations |
 | Banned repeats | 0 |
 | Slide-meta leaks | 0 |
 | `bullet_pages` == `bullets` | 9/9 |
@@ -167,7 +167,7 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 | 5 | **Column fill averages 61%**, bottom whitespace 0.83–2.72 in | Cosmetic density complaint, consistent across content slides. |
 | 6 | **No continuation marker** on paginated scenes | A reader cannot tell page 2 continues page 1. |
 | 7 | **Provenance**: a saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | An audit artifact should name the file it describes. |
-| 8 | **Reveal sync anchor is weakest on paraphrase** | Bullets are not always spoken verbatim; the anchor is the bullet's longest token, which can match a common word. See question 4. |
+| 8 | **Reveal sync is precise-looking but not verified precise** | All 9/9 scenes locate every bullet, so recall is fine. But the anchor is the bullet's *single longest token* and the match is greedy-first: in scene 6 `structure` matches at 2.26 s inside the setup clause, and in scene 1 two bullets both anchor on `baseline` and resolve only because it occurs 3 times. A reveal can therefore fire at the wrong occurrence, or drop a whole scene to an even split when a repeated token appears once. See question 4. |
 
 ## 11. The five questions
 

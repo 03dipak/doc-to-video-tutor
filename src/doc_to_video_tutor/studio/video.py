@@ -105,7 +105,26 @@ def _clip_voice(script: dict, voice: str | None) -> tuple[str, str, str, str]:
             str(script.get("volume", "+0%")))
 
 
-def _bullet_start_times(bullets: list[str], timings: list[dict]) -> list[float]:
+def _spoken_tokens(text: str, rules: tuple | None) -> list[str]:
+    """Tokens of ``text`` in the same form the provider actually spoke.
+
+    The word stream we match against comes from `WordBoundary` events, which
+    segment the *post-expansion* spoken text. A bullet is stored raw, so digits,
+    snake_case identifiers and the M1-M12 rules all differ between the two sides.
+    Measured on a real render: 0 of 383 boundary words were digits while 11 were
+    number-words, so a bullet containing `3` could never match a stream holding
+    `three` - at any weighting. Canonicalising the bullet through the same
+    `speech_expand` the TTS text went through removes that asymmetry.
+    """
+    if not rules:
+        return _nar_tokens(str(text))
+    from .speech import speech_expand
+
+    return _nar_tokens(speech_expand(str(text), rules))
+
+
+def _bullet_start_times(bullets: list[str], timings: list[dict],
+                        rules: tuple | None = None) -> list[float]:
     """First-spoken time for each bullet, or -1 when it cannot be located.
 
     Matching is token-level against the same canonical tokenizer the repeat
@@ -115,6 +134,9 @@ def _bullet_start_times(bullets: list[str], timings: list[dict]) -> list[float]:
     almost always miss and silently degrade every scene to an even split. A
     single long token survives rephrasing. Bullets that are never spoken, or
     that appear out of order, return -1 and the caller falls back.
+
+    ``rules`` are the profile's pronunciation rules; see `_spoken_tokens` for why
+    the bullet side has to be expanded before it can be compared.
     """
     if not bullets or not timings:
         return []
@@ -124,7 +146,7 @@ def _bullet_start_times(bullets: list[str], timings: list[dict]) -> list[float]:
     starts: list[float] = []
     cursor = 0
     for bullet in bullets:
-        tokens = [t for t in _nar_tokens(str(bullet)) if len(t) >= 4]
+        tokens = [t for t in _spoken_tokens(bullet, rules) if len(t) >= 4]
         if not tokens:
             starts.append(-1.0)
             continue
@@ -141,7 +163,8 @@ def _bullet_start_times(bullets: list[str], timings: list[dict]) -> list[float]:
 
 def _variant_durations(scene_dur: float, variant_count: int,
                        bullets: list[str] | None = None,
-                       timings: list[dict] | None = None) -> list[float]:
+                       timings: list[dict] | None = None,
+                       rules: tuple | None = None) -> list[float]:
     """Split a scene's audio across its reveal variants.
 
     With word timings the split follows the narration: each variant starts when
@@ -154,7 +177,7 @@ def _variant_durations(scene_dur: float, variant_count: int,
     per_variant = (scene_dur - min(scene_dur * 0.15, 3.0)) / (variant_count - 1)
     fallback = [min(scene_dur * 0.15, 3.0)] + [per_variant] * (variant_count - 1)
     starts = _bullet_start_times((bullets or [])[:variant_count - 1],
-                                 timings or [])
+                                 timings or [], rules)
     if len(starts) != variant_count - 1 or any(s < 0 for s in starts):
         return fallback
     # Variant boundaries are the moments each bullet is spoken: the intro holds
@@ -243,7 +266,8 @@ def _audit_clip_health(paths: list[Path]) -> list[str]:
 def assemble_video(slide_groups: list[list[Path]], audios: list[Path],
                    out_path: Path, pause: float = 3.0, end_hold: float = 6.0,
                    timings: list[list[dict] | None] | None = None,
-                   bullets_by_scene: list[list[str] | None] | None = None) -> None:
+                   bullets_by_scene: list[list[str] | None] | None = None,
+                   rules: tuple | None = None) -> None:
     from moviepy import (
         AudioClip,
         AudioFileClip,
@@ -271,7 +295,7 @@ def assemble_video(slide_groups: list[list[Path]], audios: list[Path],
                              if bullets_by_scene and i < len(bullets_by_scene)
                              else None)
             parts = _variant_durations(scene_dur, len(variants),
-                                      scene_bullets, scene_timings)
+                                      scene_bullets, scene_timings, rules)
         for j, (vp, d) in enumerate(zip(variants, parts, strict=True)):
             if j == len(variants) - 1 and i < len(slide_groups) - 1:
                 d += pause  # hold the last variant through the silence gap
@@ -305,6 +329,27 @@ def assemble_video(slide_groups: list[list[Path]], audios: list[Path],
                                          "-x264-params", "nal-hrd=cbr"],
                           logger="bar")
     print(f"  Video written: {out_path} ({offset:.1f}s)")
+def _profile_rules(script: dict) -> tuple | None:
+    """Pronunciation rules of the profile the script was built with.
+
+    Reveal matching has to expand bullets the same way the TTS text was expanded,
+    so the rules are resolved from the script's own recorded profile. Recording
+    the profile name in the artifact (rather than re-deriving it from ambient
+    config) is what makes the two sides provably the same expansion.
+    """
+    from .voice import _make_voice
+
+    name = script.get("voice_profile")
+    if not name:
+        return None
+    try:
+        return tuple(_make_voice(str(name)).pronunciation_rules)
+    except SystemExit:
+        print(f"  [sync] voice profile {name!r} is not registered; reveal "
+              f"timings fall back to an even split")
+        return None
+
+
 def _render_media(plan: dict, out_base: Path, script: dict, voice: str | None,
                   skip_video: bool, pause: float, end_hold: float = 6.0) -> None:
     """Deterministic media render from an existing lesson plan (no LLM).
@@ -366,4 +411,5 @@ def _render_media(plan: dict, out_base: Path, script: dict, voice: str | None,
         assemble_video(slides, audios, Path(f"{out_base}.mp4"),
                        pause=pause, end_hold=end_hold,
                        timings=[None, *timings],
-                       bullets_by_scene=[None, *bullets_by_scene])
+                       bullets_by_scene=[None, *bullets_by_scene],
+                       rules=_profile_rules(script))

@@ -813,6 +813,7 @@ Two residual warnings remain from the same re-review, neither a regression:
 | 10 | Spoken word count outside 25–65 on two clips (78 and 20) | **CLOSED** — the 25–65 band was the defect, not the clips. The code gate in §9.1 is authoritative (FAIL < 20 or > 90, WARN < 25 or > 70); the reviewer checklist now defers to it, so 78 is correctly a WARN. Recorded in §22.2 |
 | 11 | Reviewer checklist still asserts a 5–8 scene band, which conflicts with the concept-driven frame (up to 12) | **CLOSED** — the checklist now requires equality with the plan's own `scene_target` and cites the 5–12 concept frame; the fixed 5–8 rule is gone. Recorded in §22.2 |
 | 12 | A saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | Provenance should name the file it describes |
+| 13 | Reveal sync matches on a bullet's single longest token, so a token repeated in surrounding prose can win the match ahead of the bullet's real occurrence | Every bullet is *located* (9/9 scenes align), so this is a precision defect, not recall. Two measured cases: (a) scene 6 anchors `structure` at 2.26 s, inside the setup clause "structure before values not values before structure", not where the bullet is spoken; (b) scene 1's bullets 3 and 4 both anchor on `baseline` and resolve only because the word occurs 3 times (17.4/20.9/29.8 s) — with one occurrence, bullet 4 would return -1 and drop the whole scene to an even split. Greedy first-match is the cause. Scoring candidate positions by how much of the bullet matches *near* them would fix both without a model. |
 
 ### 20.3 Verified good in the same review
 
@@ -984,7 +985,7 @@ render, not by inspection.
 | `silencedetect` audio QA | done | warning-only; 10/10 clips clean on v022 |
 | TTS backend seam + per-clip retry | **open** | not started |
 | WordBoundary capture | done | 383 timings over 10 clips → `.word_timings.json` |
-| reveal alignment | done | 7/9 scenes aligned, 2 fell back to even split |
+| reveal alignment | done | 9/9 scenes aligned against the real clip durations. Recall is not the weak point; *when* the match lands is. See §20.2 defect 13 |
 | SRT via `SubMaker` | **open** | not started |
 | burned-in captions | **open** | not started |
 | Pygments colouring | done | recolour-only, verified to preserve text exactly |

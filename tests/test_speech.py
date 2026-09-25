@@ -550,3 +550,34 @@ def test_code_line_colors_use_the_extension_and_degrade_flat() -> None:
     # A hint with no recognisable extension degrades to one flat run.
     assert _code_line_colors(["def compare(base):"], "noextension") == [
         [("def compare(base):", (140, 200, 255))]]
+
+
+def test_bullet_start_times_expands_bullets_into_spoken_form() -> None:
+    """A digit-bearing bullet must match a stream that spells the digit out.
+
+    The word stream comes from the provider, which segments the post-expansion
+    spoken text. Before canonicalisation a bullet holding `3` produced the token
+    "3" and could never match a stream holding "three" - silently, at any
+    weighting, because no score function can compare unequal strings.
+    """
+    from doc_to_video_tutor.studio.video import _bullet_start_times, _profile_rules
+
+    script = {"voice_profile": "mhe-mix"}
+    rules = _profile_rules(script)
+    assert rules, "the mhe-mix profile must resolve pronunciation rules"
+
+    # The stream as edge-tts actually returns it for a spoken "... exit 3 ...".
+    timings = [{"text": "exit", "start": 1.0},
+               {"text": "three", "start": 1.4},
+               {"text": "wins", "start": 1.9}]
+    bullet = ["the 3 chip"]
+
+    assert _bullet_start_times(bullet, timings) == [-1.0]
+    assert _bullet_start_times(bullet, timings, rules) == [1.4]
+
+
+def test_profile_rules_is_safe_for_unknown_profile() -> None:
+    from doc_to_video_tutor.studio.video import _profile_rules
+
+    assert _profile_rules({}) is None
+    assert _profile_rules({"voice_profile": "no-such-voice"}) is None
