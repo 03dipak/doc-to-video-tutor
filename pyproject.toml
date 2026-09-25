@@ -1,0 +1,70 @@
+[project]
+name = "doc-to-video-tutor"
+version = "0.1.0"
+description = "Convert design docs / PPT / transcripts into beginner-friendly audio or video lessons"
+readme = "README.md"
+authors = [
+    { name = "03dipak", email = "03dip.vaidya@gmail.com" }
+]
+requires-python = ">=3.12"
+ dependencies = [
+     "python-dotenv>=1.0",
+     "requests>=2.31",
+     "edge-tts>=6.1",
+     "moviepy>=1.0.3",
+     "python-pptx>=0.6.23",
+     "Pillow>=10.0",
+     "pydantic>=2.0",
+ ]
+
+[project.scripts]
+doc-to-video-tutor = "doc_to_video_tutor:main"
+doc-to-studio = "doc_to_video_tutor.studio:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.11",
+    "mypy>=1.15",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "ARG", "RUF"]
+ignore = [
+    "ARG001",   # unused function args (kept for API symmetry)
+    "RUF001",   # confusable characters (Unicode symbols used in UI)
+    "RUF003",   # confusable characters in strings
+]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = []
+ignore_missing_imports = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+strict_optional = true
+
+[[tool.mypy.overrides]]
+module = ["doc_to_video_tutor.studio", "doc_to_video_tutor.studio.*"]
+disallow_untyped_defs = false
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=8.0",
+    "ruff>=0.16.7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

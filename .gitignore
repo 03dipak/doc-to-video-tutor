@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — copy from .env.example, never commit
+.env
+
+# Generated media + secrets
+output/
+slides_tmp/
+*.mp3
+*.mp4
+*temp_mpy_wvf_snd.mp3
+
+# Caches / tool artifacts
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.temp/
+*:Zone.Identifier

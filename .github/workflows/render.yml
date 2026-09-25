@@ -1,0 +1,70 @@
+name: docs-as-code render
+
+on:
+  push:
+    paths:
+      - "modules/*.md"
+      - "**/*concepts*.md"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source markdown to render (relative to repo root)"
+        required: false
+        default: "modules/08_concepts_mod03_gates.md"
+      minutes:
+        description: "Target spoken length"
+        required: false
+        default: "4.0"
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "uv"
+
+      - name: Install uv
+        run: pipx install uv
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Typecheck
+        run: uv run mypy src
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Regenerate lesson from source markdown (Docs-as-Code)
+        run: |
+          uv run doc-to-studio build "$SOURCE" \
+            --minutes "$MINUTES" \
+            --out "$OUT" \
+            --skip-video
+        env:
+          SOURCE: ${{ github.event.inputs.source || 'modules/08_concepts_mod03_gates.md' }}
+          MINUTES: ${{ github.event.inputs.minutes || '4.0' }}
+          OUT: output/github_action_lesson
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+
+      - name: Upload lesson artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lesson-plan-and-media
+          path: |
+            output/**/*.plan.json
+            output/**/*.rejected.*
+            output/**/*.tts_script.json
+            output/**/*.script.txt
+            output/**/*.mp4
+            output/**/*.pptx
+          if-no-files-found: warn
