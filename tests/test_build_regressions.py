@@ -706,3 +706,45 @@ def test_the_repeated_trigram_spans_a_fragment_join() -> None:
                      for k in range(max(len(_nar_tokens(
                          str(sc.get("narration", "")))) - 2, 0)))]
     assert scenes == [4], f"expected the repeat in scene 4 only, got {scenes}"
+
+
+# --- a failed first LLM attempt is recoverable, and must read that way ----
+#
+# Observed on mod03_gates_v012_009. The log printed a large alarming debug block
+# - "LLM did not return a JSON lesson plan" plus a dump of raw output - and then
+# carried on and produced the best build of the session: TTS QA PASS with zero
+# warnings, duration 97% of target, clean layout.
+#
+# The retry is real and silent: plan_lesson catches the RuntimeError and re-probes
+# with a larger completion budget, which is why only one "Planning lesson" line
+# appears for two attempts. So the debug block describes ONE failed attempt out
+# of two, not a failed build - and nothing on screen said so.
+#
+# Verified separately: the saved raw really does contain no decodable plan object
+# (a brace-matching scan finds no `{` that decodes to a dict carrying `scenes`),
+# so the parse failure was genuine and the heuristic was not crying wolf.
+
+def test_a_parse_failure_debug_says_the_build_continues() -> None:
+    import inspect
+
+    from doc_to_video_tutor.studio import plan as P
+
+    src = inspect.getsource(P.plan_lesson)
+    assert "_dump_parse_failure(" in src
+    # The context string must tell the reader this attempt is recoverable.
+    # Match a phrase that is not split across two f-string literals, so this
+    # asserts the message rather than the source formatting.
+    assert "Recoverable: retrying" in src
+    assert "not a build failure" in src
+
+
+def test_plan_parse_rejects_a_raw_with_no_complete_object() -> None:
+    """A ragged response must be refused, not salvaged into a broken plan."""
+    import pytest
+
+    from doc_to_video_tutor.studio.llm import _parse_plan_json
+
+    ragged = ('```json\n{"title": "T", "scenes": [{"title": "A", '
+              '"narration": "n", "bullets": ["b"]}\n')
+    with pytest.raises(RuntimeError):
+        _parse_plan_json(ragged)

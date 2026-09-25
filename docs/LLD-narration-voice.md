@@ -1081,3 +1081,31 @@ variation is the whole problem.
 
 The consensus that survived all three: **measure, then paginate, never shrink.**
 That is the rule now encoded in `_RowStack` and `_paginate_by_height`.
+
+### 22.8 A failed first LLM attempt is recoverable, and the log did not say so
+
+`mod03_gates_v012_009` printed a large `[debug]` block — "LLM did not return a
+JSON lesson plan" plus a dump of the raw completion — and then went on to produce
+the strongest build of the session: TTS QA PASS with **zero** warnings, duration
+97 % of target, a clean layout audit.
+
+Both halves are correct, and reading the log does not make that obvious:
+
+- The failure was real. A brace-matching scan of the saved raw finds no `{` that
+  decodes to an object carrying `scenes`, so the plan genuinely did not parse and
+  the truncation heuristic was not crying wolf.
+- The recovery is real and silent. `plan_lesson` catches the `RuntimeError` and
+  re-probes with a larger completion budget, which is why only one "Planning
+  lesson" line appears for two attempts.
+
+So the block describes one failed attempt out of two, not a failed build, and
+nothing said so. The debug context now states that it is recoverable and that it
+is not a build failure unless the retry also fails. No behavioural change: the
+retry ladder is untouched.
+
+One inconsistency is recorded rather than explained. The dump's own header
+reports `truncated_heuristic=False` while `_looks_truncated` over the same saved
+text returns True, since the raw has a brace and bracket imbalance of +2. Both
+computations run on the same string in the same function, so the discrepancy is
+not explained. It is cosmetic — the raw is refused either way — and it is left
+open rather than guessed at.

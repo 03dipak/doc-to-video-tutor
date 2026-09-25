@@ -1588,7 +1588,10 @@ def plan_lesson(content: str, target_minutes: float,
             if raw is not None:
                 _dump_parse_failure(
                     raw, f"plan grip={'' if not grip else 're-grip'} "
-                         f"window={window} budget={max_out} -> {exc}")
+                         f"window={window} budget={max_out} -> {exc}. "
+                         f"Recoverable: retrying with a larger completion "
+                         f"budget, so this is not a build failure unless the "
+                         f"retry also fails.")
             # Truncated/parse-failed plan JSON (finish_reason=length or ragged
             # JSON) is an OUTPUT-side cut: max_tokens was exhausted mid-object.
             # The old fallback re-fixed the source window to 8000 and recomputed
