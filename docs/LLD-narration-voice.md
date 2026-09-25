@@ -994,7 +994,7 @@ render, not by inspection.
 | WebVTT caption track | done | 53 cues over a 383-word lesson, spanning 4:09 against 223 s of audio plus nine pauses |
 | digest-bound audit artifacts | done | `audit_plan_digest_mismatch` is hard in `verify`; an audit with no digest is reported |
 | lowercase token-fusion detection | done | flags 1/9 scenes on the real plan; warns with a candidate split, does not rewrite |
-| measured lesson duration | done | ffprobe-measured and authoritative once audio exists; pre-audio estimate retained but demoted |
+| measured lesson duration | done | ffprobe-measured and authoritative once audio exists; pre-audio estimate retained, labelled as an estimate. Bands are symmetric (80/92/115/150 %) — the first version only checked the short side, so a fresh build at 109 % of target reported PASS and so would 300 % |
 | coverage floor in CI | done | 58 % against the studio package; per-module table reported so the trend stays visible |
 | scoped `zoompan` | **open** | not started |
 | SVG diagram backend | **open** | not started |

@@ -304,16 +304,58 @@ def _clip_seconds(path: Path) -> float:
         return 0.0
 
 
+# Measured-duration bands, as a fraction of the declared target. Symmetric:
+# undershoot and overshoot are different defects with different remedies.
+_DURATION_BAND_LOW = 0.80      # below -> FAIL
+_DURATION_BAND_OK = 0.92       # below -> WARN short
+_DURATION_BAND_OK_HIGH = 1.15  # above -> WARN long
+_DURATION_BAND_HIGH = 1.50     # above -> FAIL
+
+
+def _duration_verdict(ratio: float) -> tuple[str, str]:
+    """Band a measured/target duration ratio.
+
+    Symmetric on purpose. The first version of this check only ever looked at the
+    short side, so a fresh `build` that rendered 4.38 min against a 4.0 min
+    target (109%) reported PASS - and so would 300%, since anything at or above
+    0.92 cleared it. A lesson twice its declared length is as much a product
+    defect as one at half, and it needs a different remedy: overshoot is trimmed
+    selectively, undershoot is filled with source-grounded teaching.
+
+    Bands are advisory rather than blocking, matching the rest of the media
+    layer: the remedy for either side is a content decision, not a mechanical
+    fix, and auto-trimming narration would risk the grounding the gates exist to
+    protect.
+    """
+    if ratio < _DURATION_BAND_LOW:
+        return "FAIL", ("lesson_duration_critical_short: the render reaches only "
+                        f"{ratio:.0%} of the declared target, so the lesson does "
+                        "not meet its stated format")
+    if ratio < _DURATION_BAND_OK:
+        return "WARN", ("lesson_duration_short: the render is materially under "
+                        f"target at {ratio:.0%}. Add source-grounded teaching - "
+                        "never padding")
+    if ratio > _DURATION_BAND_HIGH:
+        return "FAIL", ("lesson_duration_critical_long: the render reaches "
+                        f"{ratio:.0%} of the declared target, which is a pacing "
+                        "defect rather than extra teaching")
+    if ratio > _DURATION_BAND_OK_HIGH:
+        return "WARN", ("lesson_duration_long: the render runs long at "
+                        f"{ratio:.0%} of target; trim selectively rather than "
+                        "across the board")
+    return "PASS", ""
+
+
 def _report_measured_duration(paths: list[Path], script: dict) -> None:
-    """Report the rendered duration and re-check the target against measurement.
+    """Report the rendered duration and band it against the target.
 
     The pre-audio gate can only estimate, because it runs before the provider is
     called. Once the clips exist the estimate is no longer needed and is in fact
     misleading: on mod03_gates_v023 the estimate said 2.84 min against a 4.0 min
     target (71%, warning) while ffprobe measured 3.72 min (93%, no warning). Any
     duration policy built on the estimate would have chased a defect that was not
-    there. So the authoritative number is printed from the audio, and the
-    under-run check is re-evaluated against it.
+    there. So the authoritative number is printed from the audio, and the finding
+    is derived from that rather than from the estimate.
     """
     target = float(script.get("target_minutes") or 0.0)
     total = sum(_clip_seconds(p) for p in paths)
@@ -325,14 +367,11 @@ def _report_measured_duration(paths: list[Path], script: dict) -> None:
               f"({total:.1f}s across {len(paths)} clips)")
         return
     ratio = measured_min / target
-    verdict = "PASS" if ratio >= 0.92 else ("WARN" if ratio >= 0.80 else "FAIL")
+    verdict, finding = _duration_verdict(ratio)
     print(f"  duration  : {measured_min:.2f} min measured vs {target:.2f} min "
           f"target = {ratio:.0%} [{verdict}]")
-    if verdict != "PASS":
-        print(f"  [WARN] lesson_duration_short: rendered audio reaches only "
-              f"{ratio:.0%} of the declared target. This is a content-density "
-              f"signal, not a narration-safety failure - the fix is more "
-              f"source-grounded teaching, never padding (LLD 22.6)")
+    if finding:
+        print(f"  [{verdict}] {finding}")
 
 
 def _audit_clip_health(paths: list[Path]) -> list[str]:

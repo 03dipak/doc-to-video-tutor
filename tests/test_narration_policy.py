@@ -329,3 +329,30 @@ def test_audit_binding_flags_an_unbound_audit(tmp_path) -> None:
     findings = check_audit_binding(plan_p, audit_p)
     assert findings and "audit_plan_digest_missing" in findings[0]
     assert json.loads(audit_p.read_text())["plan"] == "somewhere/else.plan.json"
+
+
+def test_duration_verdict_is_symmetric(monkeypatch, capsys) -> None:
+    """Overshoot must be banded too, not just undershoot.
+
+    The first version cleared anything at or above 92%, so a build that rendered
+    109% of target - and one that rendered 300% - both reported PASS.
+    """
+    from pathlib import Path
+
+    from doc_to_video_tutor.studio import video
+
+    monkeypatch.setattr(video, "_clip_seconds", lambda _p: 4.38 * 60 / 10)
+    video._report_measured_duration([Path(f"c{i}.mp3") for i in range(10)],
+                                    {"target_minutes": 4.0})
+    assert "110%" in capsys.readouterr().out  # 4.38/4.0 rounds up
+
+    # A lesson twice its declared length is a pacing defect, not a pass.
+    monkeypatch.setattr(video, "_clip_seconds", lambda _p: 8.0 * 60 / 10)
+    video._report_measured_duration([Path(f"c{i}.mp3") for i in range(10)],
+                                    {"target_minutes": 4.0})
+    out = capsys.readouterr().out
+    assert "[FAIL]" in out
+    assert "lesson_duration_critical_long" in out
+    # And the remedy differs by side: never pad a short one.
+    assert "trim" in video._duration_verdict(1.20)[1]
+    assert "padding" in video._duration_verdict(0.85)[1]

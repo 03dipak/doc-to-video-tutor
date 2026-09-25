@@ -155,8 +155,13 @@ def _write_tts_artifacts(out_base: Path, script: dict, args) -> None:
     target_min = float(script.get("target_minutes") or 0.0)
     spoken_min = words / LOUDNESS_WPM
     if target_min:
-        print(f"  narration   : {words} words (~{spoken_min:.1f} min spoken) "
-              f"vs target {target_min:.1f} min")
+        # Labelled as an estimate on purpose. No audio exists yet at this point,
+        # so this is a projection from a calibrated words-per-minute constant,
+        # and printing it unqualified next to the measured figure reported after
+        # TTS invites reading a ~6% projection as the real duration. The
+        # authoritative number is the ffprobe measurement in _render_media.
+        print(f"  narration   : {words} words (~{spoken_min:.1f} min estimated "
+              f"pre-audio) vs target {target_min:.1f} min")
         under_run = narration_under_run_warning(words, target_min)
         if under_run:
             print(f"    [WARN] {under_run}")
