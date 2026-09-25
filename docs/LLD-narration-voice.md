@@ -806,13 +806,13 @@ Two residual warnings remain from the same re-review, neither a regression:
 
 | # | Defect | Note |
 |---|---|---|
-| 5 | Fused token in narration: `ki`+`deterministic` renders as `kideterministic` | TTS will read a non-word; add a fusion guard |
+| 5 | Fused token in narration: `ki`+`deterministic` renders as `kideterministic` | **PARTLY CLOSED** — the root cause was not a text-assembly join. The token is model-authored, absent from the source, and survived four repair passes because `tts_unknown_token` only inspects *capitalised* tokens, so a lowercase fusion is invisible to it. `_fused_particle_tokens` now reports `tts_token_fusion` (WARN) with the candidate split, requiring both halves to be independently attested: whole token unknown, prefix a known Hindi particle, suffix a word the plan uses elsewhere. The third condition is load-bearing — without it `killed` and `together` split attractively. On `mod03_gates_v021` it flags 1/9 scenes, the one with the defect. Deliberately **not** auto-repaired: below the auto-repair bar the finding should surface, not mutate the script. |
 | 6 | Badge chip text is 15 pt, below the 18 pt body floor | **CLOSED** — raised to 16 pt with a wider box, and the chip gutter widened 0.12 → 0.20 in so `4 CONFIG ERR` stays on one line and the red/green pair no longer vibrates |
 | 8 | Column fill averages 61 %, bottom whitespace ranges 0.83–2.72 in across content slides | Matches the "unused space" complaint in §19.4 |
 | 9 | Paginated scenes repeat the same header on each page with no continuation marker | Add a "continued" affordance when a scene spans pages |
 | 10 | Spoken word count outside 25–65 on two clips (78 and 20) | **CLOSED** — the 25–65 band was the defect, not the clips. The code gate in §9.1 is authoritative (FAIL < 20 or > 90, WARN < 25 or > 70); the reviewer checklist now defers to it, so 78 is correctly a WARN. Recorded in §22.2 |
 | 11 | Reviewer checklist still asserts a 5–8 scene band, which conflicts with the concept-driven frame (up to 12) | **CLOSED** — the checklist now requires equality with the plan's own `scene_target` and cites the 5–12 concept frame; the fixed 5–8 rule is gone. Recorded in §22.2 |
-| 12 | A saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | Provenance should name the file it describes |
+| 12 | A saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | **CLOSED** — the audit recorded the *input* path while shipping beside the *repaired* plan, with nothing binding them, so a renamed or replaced plan inherited a clean bill of health. `plan_sha256` is now computed from the plan *after* it lands, `check_audit_binding` reports `audit_plan_digest_mismatch` as hard in `verify`, and an audit carrying no digest is reported rather than assumed good. The path is retained as display metadata only: identity comes from content, never from a name. |
 | 13 | ~~Reveal sync matches on a bullet's single longest token, so a token repeated in surrounding prose can win the match ahead of the bullet's real occurrence~~ **CLOSED** | Fixed by scoring candidate positions instead of committing to the first hit. `_best_window` scores every occurrence of any bullet token by the weighted fraction of the bullet's whole token set inside a window the size of the bullet's own spoken span; tokens are weighted by inverse frequency *within the scene*, so a word the narrator repeats in setup prose cannot dominate. Verified on the real lesson: scene 6's first reveal moved 2.26 s -> 13.68 s, landing on "engine checks structure" instead of the earlier mention; scene 1's fourth bullet moved 20.9 s -> 25.4 s, off the shared `baseline` anchor. Still 9/9 located, all start times monotonic, and every scene's variant durations still sum to its clip. The search stays monotonic and still returns -1 for a bullet it cannot place, so the §19.5 degrade contract is unchanged. |
 
 ### 20.3 Verified good in the same review
@@ -841,6 +841,7 @@ off-canvas.
 | `<name>.rejected.tts_script.json` | Pre-audio gate failure with the exact script |
 | `<name>.tts_script.json` / `.script.txt` | Exact TTS input and a readable transcript |
 | `<name>.word_timings.json` | Per-word offsets from `WordBoundary`; drives reveal sync (§19.5 step 3) |
+| `<name>.vtt` | WebVTT caption track built from the same `WordBoundary` stream; cue times advance by each clip's *measured* duration, since every clip carries trailing silence after its last word |
 | `<name>_audio/scene_*.mp3` | Per-scene voice-over for external listening |
 | `<name>.pptx` | Lesson deck |
 | `<name>.mp4` | Rendered video |
@@ -989,9 +990,55 @@ render, not by inspection.
 | SRT via `SubMaker` | **open** | not started |
 | burned-in captions | **open** | not started |
 | Pygments colouring | done | recolour-only, verified to preserve text exactly |
+| WebVTT caption track | done | 53 cues over a 383-word lesson, spanning 4:09 against 223 s of audio plus nine pauses |
+| digest-bound audit artifacts | done | `audit_plan_digest_mismatch` is hard in `verify`; an audit with no digest is reported |
+| lowercase token-fusion detection | done | flags 1/9 scenes on the real plan; warns with a candidate split, does not rewrite |
+| measured lesson duration | done | ffprobe-measured and authoritative once audio exists; pre-audio estimate retained but demoted |
+| coverage floor in CI | done | 58 % against the studio package; per-module table reported so the trend stays visible |
 | scoped `zoompan` | **open** | not started |
 | SVG diagram backend | **open** | not started |
+| TTS backend seam + capability model | **open** | accepted in §22.6, not started |
+| `SourceEvidenceBundle` for repair | **open** | accepted in §22.6, not started; the highest-severity open item |
 
 The two still-open M0 items (backend seam, retry) are the reason M0 is not yet
 called complete; the enrichment tiers can proceed because they are independent of
 provider choice.
+
+### 22.6 External review, first pass — disposition
+
+An external review of §19/§22 proposed a lesson-level duration budget, a
+constrained source-assignment stage, a layered token-fusion detector, monotonic
+weighted reveal alignment, a TTS backend seam with a capability model, a caption
+sidecar, and digest-bound audits. Disposition, with the reason each way:
+
+| Proposal | Disposition | Reason |
+|---|---|---|
+| Lesson-level duration budget with FAIL/WARN bands | **corrected on receipt** | The motivating number was wrong — see below. The *principle* survives: a quality target is not the same instrument as a hard safety invariant, and the per-scene word floor is not a duration control. |
+| Assign source chunks after scene titles exist; give repair a resolved `SourceEvidenceBundle` instead of a raw string | **accepted, open** | Highest-severity structural item, and the only one that changes a gate rather than a metric. `source_chunk` is dual-use: it supplies provenance evidence, hydration material and enrichment, so a misplaced string is hidden authority. |
+| Layered fusion detector, no auto-repair below a high-confidence bar | **adopted, shipped** | See §20.2 defect 5. Detection plus a candidate split; no silent rewrite. |
+| Monotonic weighted alignment for reveal sync, instrument before choosing | **already shipped** | Implemented in `1e70bb7` as candidate scoring by weighted coverage with a scene-local inverse-frequency weight; the review was working from the pre-fix state. |
+| TTS backend seam with an explicit capability model | **accepted, open** | Agreed with the emphasis: the abstraction must not be shaped around Edge's `WordBoundary`, or a backend without native timings silently degrades reveal sync. Capability differences are the contract, not the implementation. |
+| WebVTT caption sidecar from existing word timings | **adopted, shipped** | Cues advance by measured clip duration, not by last-word offset, because every clip carries trailing silence. |
+| Digest-bound audit artifacts | **adopted, shipped** | See §20.2 defect 12. |
+| 30–50 scene human-annotated reveal-sync ground truth | **rejected as specified** | The cost is wrong, not the principle. `_rebuild_scene_narration` speaks bullets verbatim, so those scenes have *exact* ground truth for free; only the non-verbatim minority needs annotation. Instrument the free set first, then decide what still needs a human. |
+| Insert deliberate spoken anchors so each bullet has a stable phrase | **deferred** | It makes the renderer dictate narration content, inverting the layering. Acceptable as an optional source-grounded concept phrase; not as a default requirement. |
+| Lengthen narration to hit the duration target | **rejected** | Padding satisfies a gate without improving teaching. A real under-run is repaired only from source-grounded material — which is why the target was wrong in the first place. |
+
+#### The two premises the review inherited were both wrong
+
+Worth recording, because it is the failure mode this document already has a name
+for (§22.2, policy drift): an external reviewer can only reason from the numbers
+we hand it, and two of ours were wrong.
+
+- It quoted a "7/9 scenes aligned" figure that was an artifact of a measurement
+  harness that passed a hardcoded 20 s scene duration. Measured against real clip
+  durations it is 9/9.
+- It built an entire duration-budget design on a "2.8 min vs 4.0 min, −30 %"
+  figure that was an *estimate* from a hardcoded 135 wpm. ffprobe on the ten
+  rendered clips measures 223.0 s = 3.72 min = **93 %** of target, which passes
+  under the review's own bands. `LOUDNESS_WPM` is recalibrated to the measured
+  103.1, and `_render_media` now treats the measured duration as authoritative.
+
+Neither was the reviewer's error. The lesson for this pipeline: a metric that no
+one has verified against a rendered artifact is a claim, not a measurement, and
+it will be repeated confidently by the next reader — including a model.
