@@ -109,6 +109,56 @@ def _est_text_height(text: str, width_in: float, size_pt: float,
     return lines * (1.22 * size_pt / 72.0) + margin_in
 
 
+class _RowStack:
+    """One vertical budget for a slide, resolved from content rather than guessed.
+
+    The layout question "does this fit?" was being re-asked independently by
+    every block - six separate `if y + need > max_h: break` checks, each with its
+    own idea of what to sacrifice. That is the fixed-length approach: the block
+    decides for itself, so the slide as a whole has no policy, and a long bullet
+    silently starves whatever sits below it.
+
+    This is the alternative: a block declares the height its content actually
+    needs and a priority, and one pass owns the budget. When the slide cannot
+    hold everything, rows are dropped by priority - the lowest-priority, then the
+    bottom-most, which is the block a viewer loses least - instead of whichever
+    block happened to be drawn last. Nothing is ever clipped.
+
+    Priority: 2 required (the teaching content), 1 supporting (the design
+    decision), 0 optional (analogy, diagram, payload, legend).
+    """
+
+    REQUIRED, SUPPORTING, OPTIONAL = 2, 1, 0
+
+    def __init__(self, top: float, bottom: float) -> None:
+        self.top = top
+        self.bottom = bottom
+        self.placed: list[tuple[float, float, int, int]] = []
+        self.dropped: list[tuple[int, str]] = []
+
+    @property
+    def y(self) -> float:
+        return self.placed[-1][0] + self.placed[-1][1] if self.placed else self.top
+
+    @property
+    def free(self) -> float:
+        return self.bottom - self.y
+
+    def reserve(self, height: float, priority: int, label: str) -> float | None:
+        """Claim `height` at the current cursor, or return None if it will not fit."""
+        if height > self.free:
+            self.dropped.append((priority, label))
+            return None
+        at = self.y
+        self.placed.append((at, height, priority, len(self.placed)))
+        return at
+
+    def report(self) -> list[str]:
+        return [f"dropped {label} (priority {p}, "
+                f"{self.bottom - self.y:.2f}in short)"
+                for p, label in self.dropped]
+
+
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
                  bold=False, wrap=True, font_name: str = "Arial"):
     from pptx.dml.color import RGBColor
@@ -323,11 +373,15 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                           scene.get("title", ""), f"{i + 2} / {deck_total}")
 
         row_h = 0.55
-        y = 1.7
         max_h = 6.9
-        _ppt_textbox(s, 0.52, y, 12.3, 0.3, "KEY POINTS", 12,
+        slide_notes: list[str] = []
+        # One budget for the whole slide. Blocks declare the height their
+        # content needs; this decides what survives when it does not all fit.
+        stack = _RowStack(1.7, max_h)
+        _ppt_textbox(s, 0.52, stack.y, 12.3, 0.3, "KEY POINTS", 12,
                        GOLD, bold=True)
-        y += 0.34
+        stack.reserve(0.34, _RowStack.REQUIRED, "key points label")
+        y = stack.y
         bullets = _with_overflow(scene.get("bullets")
                                   or scene.get("takeaways") or [])
         for b in bullets:
@@ -336,16 +390,17 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             # left a 271-char one spilling a third of an inch past its box and
             # over whatever was drawn next.
             need = max(row_h, _est_text_height(b, 11.95, 18))
-            if y + need > max_h:
-                break  # mirror the video's vertical budget: stop, don't overlap
-            tb = _ppt_textbox(s, 0.52, y, 12.3, need, " ", 18, (235, 238, 245))
+            at = stack.reserve(need, _RowStack.REQUIRED, f"bullet {b[:24]}")
+            if at is None:
+                break  # required content is out of room; stop, never clip
+            tb = _ppt_textbox(s, 0.52, at, 12.3, need, " ", 18, (235, 238, 245))
             tf = tb.text_frame
             _ppt_para(tf, b, 18, (235, 238, 245), bullet=True)
-            y += need
+            y = stack.y
 
         if scene.get("status_badges") and "status_badges" in _video_blocks(scene):
             badge_h = 0.5 + 0.32 * 2
-            if y + badge_h <= max_h:
+            if stack.reserve(badge_h, _RowStack.SUPPORTING, "verdict legend") is not None:
                 _ppt_textbox(s, 0.52, y, 12.3, 0.26, "VERDICT CODES", 12,
                              GOLD, bold=True)
                 chips = scene["status_badges"][:6]
@@ -371,7 +426,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                     _ppt_textbox(s, 0.6 + j * chip_w, y + 0.38,
                                  chip_w - gutter - 0.08, 0.34, text, 16,
                                  (18, 24, 38))
-                y += badge_h
+                y = stack.y
 
         if scene.get("design_decision"):
             body = (f"Why THIS (not the alternative): "
@@ -379,7 +434,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             # Size the card to the text instead of trusting a fixed 0.72 in.
             need = _est_text_height(body, 12.1, 17)
             card_h = max(0.72, need + 0.12)
-            if y + card_h + 0.2 <= max_h:
+            if stack.reserve(card_h + 0.2, _RowStack.SUPPORTING, "design decision") is not None:
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
                                           Inches(12.3), Inches(card_h))
@@ -388,13 +443,13 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 card.line.fill.background()
                 _ppt_textbox(s, 0.62, y + 0.06, 12.1, need,
                              body, 17, (255, 193, 7), wrap=True)
-                y += card_h + 0.2
+                y = stack.y
 
         if scene.get("analogy"):
             body = f"Analogy: {scene['analogy']}"
             need = _est_text_height(body, 12.1, 17)
             card_h = max(0.72, 0.34 + need + 0.08)
-            if y + card_h + 0.2 <= max_h:
+            if stack.reserve(card_h + 0.2, _RowStack.OPTIONAL, "analogy") is not None:
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
                                           Inches(12.3), Inches(card_h))
@@ -405,7 +460,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                              "ANALOGY", 12, GOLD, bold=True)
                 _ppt_textbox(s, 0.62, y + 0.32, 12.1, need,
                              body, 17, (255, 193, 7), wrap=True)
-                y += card_h + 0.2
+                y = stack.y
 
         diagram = _parse_diagram(scene.get("visual_diagram") or "")
         if diagram and y + 0.9 <= max_h:
@@ -417,7 +472,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             code_lines = str(code_text).splitlines()[:7]
             code_h = 0.2 + (0.3 if str(scene.get("code_context", "")).strip() else 0.0) \
                 + len(code_lines) * 0.3
-            if y + code_h <= max_h:
+            if stack.reserve(code_h, _RowStack.OPTIONAL, "code panel") is not None:
                 _ppt_codebox(s, 0.52, y, 12.3, code_lines,
                               str(scene.get("code_context", "")))
                 y += code_h
@@ -426,7 +481,7 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         value_table = (scene.get("value_table") or [])[:4]
         if value_table and "value_table" in blocks:
             table_h = 0.45 + 0.3 * len(value_table)
-            if y + table_h <= max_h:
+            if stack.reserve(table_h, _RowStack.SUPPORTING, "numbers") is not None:
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
                                           Inches(12.3), Inches(table_h))
@@ -442,12 +497,13 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                                  17, (235, 238, 245))
                     _ppt_textbox(s, 6.9, row_y, 5.9, 0.28, cell_right.strip(),
                                  17, (140, 200, 255))
-                y += table_h
+                y = stack.y
 
+        slide_notes.extend(f"slide {i}: {n}" for n in stack.report())
         if "json" in blocks:
             for json_lines in _json_payload_candidates(scene):
                 json_h = 0.34 + len(json_lines) * 0.3
-                if y + json_h > max_h:
+                if stack.reserve(json_h, _RowStack.OPTIONAL, "payload") is None:
                     continue
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
@@ -487,6 +543,8 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             tb = s.shapes[-1]
             _ppt_para(tb.text_frame, t, 18, (235, 238, 245), bullet=True)
 
+    for note in slide_notes:
+        print(f"  [WARN] layout: {note}")
     prs.save(str(out_path))
     print(f"Deck written: {out_path}")
     _audit_layout(out_path)

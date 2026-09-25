@@ -11,6 +11,8 @@ actually emitted, the 71-word scene, the fused token - because a paraphrased
 fixture would test the idea rather than the incident.
 """
 
+import pytest
+
 from doc_to_video_tutor import studio as S
 
 # --- the build that failed: Devanagari in the plan opening ------------------
@@ -265,3 +267,128 @@ def test_unspoken_visual_claim_is_soft_not_blocking() -> None:
     from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
 
     assert "unspoken visual claim" in _SOFT_PREFIXES
+
+
+# --- a soft finding must never block the build ----------------------------
+#
+# This shipped as a real incident. `unspoken visual claim` was registered in
+# _SOFT_PREFIXES, but the finding was formatted as
+#   "scene 7 unspoken visual claim: ..."
+# and the review-before-build loop separates hard from soft with
+# `problem.startswith(prefix)`. A buried prefix means False, so the finding
+# counted as hard: three consecutive samples were rejected for the same
+# advisory finding, each burning a full plan generation (39s, 51s, 58s), and the
+# build could not complete. The model was being asked to satisfy a check it was
+# never prompted about.
+
+def test_unspoken_visual_claim_is_filtered_out_of_the_hard_problem_set() -> None:
+    """The exact mechanism that broke: the sample loop's soft filter."""
+    from doc_to_video_tutor.studio.cli import _SAMPLE_SOFT_EXTRA
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import _unspoken_visual_claims
+
+    plan = {"scenes": [{
+        "title": "Structural error classes",
+        "narration": "Exit three is a structural error and four is a pointer.",
+        "status_badges": [{"code": "0", "label": "pass"},
+                          {"code": "1", "label": "fail"}],
+    }]}
+    findings = _unspoken_visual_claims(plan)
+    assert findings, "the finding must still be reported"
+    soft_prefixes = _SOFT_PREFIXES + _SAMPLE_SOFT_EXTRA
+    hard = [f for f in findings
+            if not any(f.startswith(s) for s in soft_prefixes)]
+    assert not hard, f"advisory finding would force a resample: {hard}"
+
+
+def test_soft_finding_puts_the_prefix_first_by_construction() -> None:
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import soft_finding
+
+    message = soft_finding("scene 3 something happened")
+    assert any(message.startswith(p) for p in _SOFT_PREFIXES)
+    # And a non-default prefix is still honoured.
+    other = soft_finding("detail", prefix="fused slide token")
+    assert other.startswith("fused slide token")
+
+
+def test_every_registered_soft_prefix_is_reachable_as_a_message_start() -> None:
+    """Guards the contract itself, not one call site.
+
+    `_SOFT_PREFIXES` is only meaningful if findings are *written* to lead with
+    it. This cannot enumerate every call site, so it pins the failure mode that
+    actually happened: a soft finding whose text does not lead with its prefix.
+    """
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import soft_finding
+
+    for prefix in _SOFT_PREFIXES:
+        assert soft_finding("x", prefix=prefix).startswith(prefix)
+
+
+# --- layout is derived from content, resolved by one budget --------------
+#
+# The user's framing, and the right one: the layout question "does this fit?"
+# was being re-asked independently by six blocks, each with its own idea of what
+# to sacrifice. That is the fixed-length approach - the block decides for
+# itself, so the slide has no policy and a long bullet silently starves whatever
+# is below it. A content-driven model lets each block declare the height its
+# content needs and lets one pass decide what survives, dropping by priority
+# rather than clipping.
+
+def test_row_stack_drops_lowest_priority_first_and_never_clips() -> None:
+    from doc_to_video_tutor.studio.pptx import _RowStack
+
+    stack = _RowStack(1.7, 3.7)          # 2.0 in of room
+    # The cursor accumulates in floats, so compare with a tolerance.
+    assert stack.reserve(0.5, _RowStack.REQUIRED, "bullets") == pytest.approx(1.7)
+    assert stack.reserve(0.6, _RowStack.SUPPORTING, "decision") == pytest.approx(2.2)
+    assert stack.reserve(0.5, _RowStack.OPTIONAL, "analogy") == pytest.approx(2.8)
+    # 0.4 in left: the analogy does not fit and says so rather than clipping.
+    assert stack.reserve(0.4, _RowStack.OPTIONAL, "payload") is None
+    # Required content that cannot fit is refused, not silently truncated.
+    assert stack.reserve(1.5, _RowStack.REQUIRED, "more bullets") is None
+    assert stack.y <= 3.7
+    labels = [label for _p, label in stack.dropped]
+    assert "payload" in labels and "more bullets" in labels
+    assert stack.report()
+
+
+def test_row_stack_keeps_required_content_in_preference_to_optional() -> None:
+    """Priority, not draw order, decides what a crowded slide loses."""
+    from doc_to_video_tutor.studio.pptx import _RowStack
+
+    stack = _RowStack(0.0, 1.0)
+    stack.reserve(0.4, _RowStack.OPTIONAL, "analogy")
+    stack.reserve(0.4, _RowStack.REQUIRED, "bullet 1")
+    assert stack.reserve(0.4, _RowStack.REQUIRED, "bullet 2") is None
+    assert stack.reserve(0.4, _RowStack.OPTIONAL, "payload") is None
+    dropped = [label for _p, label in stack.dropped]
+    assert "bullet 2" in dropped and "payload" in dropped
+    assert "bullet 1" not in dropped
+
+
+def test_a_crowded_scene_drops_blocks_instead_of_overflowing(tmp_path) -> None:
+    """End to end: a scene with more content than fits must still lay out clean."""
+
+    from doc_to_video_tutor.studio.pptx import _audit_layout, build_pptx
+
+    scene = {
+        "section": "Crowded",
+        "title": "A scene carrying far more content than one slide can hold",
+        "topic": "t",
+        "narration": "n" * 40,
+        "source_refs": ["s"],
+        "bullets": [f"Bullet number {i} carrying a deliberately long sentence "
+                    f"so that the measured height exceeds the safe area and the "
+                    f"layout has to resolve a real overflow. " * 2
+                    for i in range(9)],
+        "design_decision": "why this and not the alternative, " * 6,
+        "analogy": "an analogy long enough to need its own card, " * 5,
+    }
+    plan = {"title": "T", "scenes": [scene], "takeaways": []}
+    out = tmp_path / "crowded.pptx"
+    build_pptx(plan, out)
+    assert out.exists()
+    # Whatever survived, nothing overflowed and nothing overlapped.
+    assert [f for f in _audit_layout(out) if "overflows" in f or "overlap" in f] == []

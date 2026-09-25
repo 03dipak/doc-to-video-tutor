@@ -210,6 +210,20 @@ def check_audit_binding(plan_path: Path, audit_path: Path) -> list[str]:
     return findings
 
 
+def soft_finding(detail: str, prefix: str = "unspoken visual claim") -> str:
+    """Format a finding so the soft/hard filter can actually see it.
+
+    The review-before-build loop splits problems with
+    `problem.startswith(soft_prefix)`. That is a stringly-typed contract, and
+    getting it wrong is not a cosmetic error: a finding meant to be advisory is
+    counted as hard, the sample is rejected, and the pipeline resamples the
+    whole plan - burning an LLM call to satisfy a check the model was never
+    asked to satisfy. Routing every soft finding through one constructor makes
+    the contract hold by construction rather than by remembering a convention.
+    """
+    return f"{prefix}: {detail}"
+
+
 def _unspoken_visual_claims(plan: dict,
                            voice: NarrationVoice | None = None) -> list[str]:
     """Structured visual facts the scene shows but the narration never names.
@@ -253,10 +267,17 @@ def _unspoken_visual_claims(plan: dict,
                 if not (spoken_token_set(key, rules) & spoken):
                     unspoken.append(key)
         if unspoken:
-            findings.append(
-                f"scene {index} unspoken visual claim: the slide shows "
+            # The message MUST lead with the registered soft prefix. The
+            # review-before-build sample loop separates hard from soft by
+            # `problem.startswith(prefix)`, so a finding that buries the prefix
+            # mid-sentence is counted as hard and forces a whole-plan resample.
+            # That shipped once: three samples were burned and rejected for
+            # this same finding and the build could not complete. See
+            # `soft_finding` and the guard test in test_build_regressions.
+            findings.append(soft_finding(
+                f"scene {index} the slide shows "
                 f"{', '.join(unspoken[:6])} but the narration never mentions "
-                f"them; the viewer reads facts the lesson does not explain")
+                f"them; the viewer reads facts the lesson does not explain"))
     return findings
 
 
