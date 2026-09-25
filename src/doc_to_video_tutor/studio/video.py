@@ -123,17 +123,73 @@ def _spoken_tokens(text: str, rules: tuple | None) -> list[str]:
     return _nar_tokens(speech_expand(str(text), rules))
 
 
+_MIN_MATCH_WINDOW = 4
+
+
+def _stream_weights(flat: list[str]) -> dict[str, float]:
+    """Inverse-frequency weight for every token in one scene's word stream.
+
+    Scoped to the scene rather than a corpus, so it needs no training data and
+    stays a pure function of what the provider actually said. It is what stops a
+    word the narrator repeats in surrounding prose from dominating the match: in
+    the real lesson `structure` occurs 4 times in one clip, so it counts for far
+    less than `engine` or `comparing`, which occur once.
+    """
+    import math
+
+    counts: dict[str, int] = {}
+    for tok in flat:
+        counts[tok] = counts.get(tok, 0) + 1
+    total = max(len(flat), 1)
+    return {tok: math.log(1.0 + total / count) for tok, count in counts.items()}
+
+
+def _best_window(flat: list[str], cursor: int, tokens: list[str],
+                 weights: dict[str, float]) -> tuple[int, float]:
+    """Index of the best-matching position at or after ``cursor``, and its score.
+
+    Every occurrence of any bullet token is a candidate; each is scored by the
+    weighted fraction of the bullet's *whole* token set that appears in a short
+    window starting there. Scoring the neighbourhood rather than a single anchor
+    is what fixes both measured failures: a token repeated in prose no longer
+    wins just by being first, and two bullets that share an anchor are separated
+    by the rest of their text.
+    """
+    wanted = {tok for tok in tokens}
+    if not wanted:
+        return -1, 0.0
+    total = sum(weights.get(tok, 1.0) for tok in wanted)
+    # The window is the bullet's own spoken span. Widening it does not buy
+    # recall - a bullet is still located whenever *any* of its tokens is found -
+    # it only blurs position, because a wider window lets an early mention in
+    # surrounding prose scoop up the tokens of the real bullet further along.
+    window = max(_MIN_MATCH_WINDOW, len(wanted))
+    best_at, best_score = -1, 0.0
+    for index in range(cursor, len(flat)):
+        if flat[index] not in wanted:
+            continue
+        seen = {tok for tok in flat[index:index + window] if tok in wanted}
+        score = sum(weights.get(tok, 1.0) for tok in seen) / total
+        if score > best_score:
+            best_at, best_score = index, score
+    return best_at, best_score
+
+
 def _bullet_start_times(bullets: list[str], timings: list[dict],
                         rules: tuple | None = None) -> list[float]:
     """First-spoken time for each bullet, or -1 when it cannot be located.
 
     Matching is token-level against the same canonical tokenizer the repeat
-    machinery uses, anchored on each bullet's most distinctive token rather than
-    a verbatim phrase. That matters: the narration contract deliberately stops
-    the model reading bullets verbatim (§7.5), so a multi-word phrase match would
-    almost always miss and silently degrade every scene to an even split. A
-    single long token survives rephrasing. Bullets that are never spoken, or
-    that appear out of order, return -1 and the caller falls back.
+    machinery uses. The narration contract deliberately stops the model reading
+    bullets verbatim (§7.5), so a verbatim phrase match would almost always miss
+    and silently degrade every scene to an even split; a single anchor token
+    survives rephrasing but is too weak to place a reveal, because the narrator
+    usually mentions the same words in the surrounding prose first. So a
+    candidate position is scored by how much of the bullet appears *around* it,
+    weighted by how rare each token is in this scene (see `_stream_weights`).
+    The search stays monotonic — bullets are spoken in listed order, so the cursor
+    only moves forward — and a bullet that cannot be located returns -1, which
+    makes the caller fall back to an even split for that scene alone.
 
     ``rules`` are the profile's pronunciation rules; see `_spoken_tokens` for why
     the bullet side has to be expanded before it can be compared.
@@ -144,21 +200,23 @@ def _bullet_start_times(bullets: list[str], timings: list[dict],
              for t in timings]
     flat = [tok for _, toks in words for tok in toks]
     starts: list[float] = []
+    for start, toks in words:
+        starts.extend([start] * len(toks))
+    weights = _stream_weights(flat)
+    out: list[float] = []
     cursor = 0
     for bullet in bullets:
-        tokens = [t for t in _spoken_tokens(bullet, rules) if len(t) >= 4]
+        tokens = {t for t in _spoken_tokens(bullet, rules) if len(t) >= 4}
         if not tokens:
-            starts.append(-1.0)
+            out.append(-1.0)
             continue
-        anchor = max(tokens, key=len)
-        found = -1.0
-        for index in range(cursor, len(flat)):
-            if flat[index] == anchor:
-                found = words[index][0] if index < len(words) else -1.0
-                cursor = index + 1
-                break
-        starts.append(found)
-    return starts
+        at, _score = _best_window(flat, cursor, sorted(tokens), weights)
+        if at < 0:
+            out.append(-1.0)
+            continue
+        out.append(starts[at])
+        cursor = at + 1
+    return out
 
 
 def _variant_durations(scene_dur: float, variant_count: int,

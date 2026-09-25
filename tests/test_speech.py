@@ -484,11 +484,33 @@ def test_bullet_start_times_match_spoken_words() -> None:
 
     timings = _timings([("frozen", 1.0), ("golden", 1.3), ("report", 1.6),
                         ("store", 1.9), ("delta", 5.0), ("nikalte", 5.3)])
-    # The anchor is the bullet's longest token, so "report" wins over "frozen",
-    # and "nikalte" wins over "delta".
+    # A reveal starts when the bullet's *first* word is spoken, so the second
+    # bullet resolves to 5.0 ("delta"), not to 5.3 ("nikalte"): anchoring on the
+    # single longest token used to start the reveal a word late.
     starts = _bullet_start_times(["Frozen golden report", "delta nikalte hain"],
                                  timings)
-    assert starts == [1.0, 5.3]
+    assert starts == [1.0, 5.0]
+
+
+def test_bullet_start_times_prefer_the_window_over_an_early_mention() -> None:
+    """A token the narrator mentions in passing must not win the match.
+
+    Mirrors scene 6 of the real lesson, where the narrator sets the topic up in
+    prose before actually speaking the bullet: "structure before values not
+    values before structure because the engine checks structure before
+    comparing values".
+    """
+    from doc_to_video_tutor.studio.video import _bullet_start_times
+
+    timings = _timings([("structure", 1.0), ("before", 1.4), ("values", 1.8),
+                        ("not", 2.2), ("values", 2.5), ("before", 2.8),
+                        ("structure", 3.2), ("because", 3.6), ("the", 4.0),
+                        ("engine", 6.0), ("checks", 6.3), ("structure", 6.6),
+                        ("before", 6.9), ("comparing", 7.2), ("values", 7.6)])
+    starts = _bullet_start_times(
+        ["engine checks structure before comparing values"], timings)
+    # The bullet begins at 6.0, not at the 1.0 mention in the setup clause.
+    assert starts == [6.0]
 
 
 def test_bullet_start_times_report_unmatched_bullets() -> None:

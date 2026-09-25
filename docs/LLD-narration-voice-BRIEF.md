@@ -167,7 +167,7 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
 | 5 | **Column fill averages 61%**, bottom whitespace 0.83–2.72 in | Cosmetic density complaint, consistent across content slides. |
 | 6 | **No continuation marker** on paginated scenes | A reader cannot tell page 2 continues page 1. |
 | 7 | **Provenance**: a saved `plan.audit.json` can record a `plan` path from a different file than the one it ships beside | An audit artifact should name the file it describes. |
-| 8 | **Reveal sync is precise-looking but not verified precise** | All 9/9 scenes locate every bullet, so recall is fine. But the anchor is the bullet's *single longest token* and the match is greedy-first: in scene 6 `structure` matches at 2.26 s inside the setup clause, and in scene 1 two bullets both anchor on `baseline` and resolve only because it occurs 3 times. A reveal can therefore fire at the wrong occurrence, or drop a whole scene to an even split when a repeated token appears once. See question 4. |
+| 8 | ~~Reveal sync anchors on one token, so prose mentions can win~~ **CLOSED** | Candidate positions are now scored by weighted coverage in a window the size of the bullet's own span, with tokens weighted by inverse frequency within the scene. Scene 6's first reveal moved 2.26 s -> 13.68 s, from a passing mention in the setup prose to the words actually spoken. Recall is 9/9 and every scene's variants still sum to its clip. Question 4 is now about the residual: matching is still bag-of-words, so it cannot tell a reordering from a paraphrase. |
 
 ## 11. The five questions
 
@@ -185,11 +185,16 @@ contract pins provider, voice, rate, pitch, and volume in the plan.
    without flagging legitimate ones? My worry is that this is a vocabulary
    question with no purely token-level rule.
 
-4. **Reveal sync (defect 8).** When narration paraphrases a bullet, per-word
-   offsets are exact but the bullet→offset mapping is fuzzy. Weighted token
-   overlap is order-free and survives rewording; monotonic assignment prevents
-   backward jumps. Is that the right trade, or is there a better signal? I would
-   rather instrument ground truth first than pick a heuristic on taste.
+4. **Reveal sync, residual (defect 8 is closed; this is what is left).**
+   Matching now scores candidate positions by weighted bag-of-words coverage, so
+   recall is 9/9 and a prose mention can no longer win. The residual is that a
+   bag cannot see *order*: a bullet whose words are all present but rearranged
+   scores identically to the correct position. Two questions. (a) Is scoring the
+   longest ordered run of the bullet's tokens — which the bullet's own token
+   order makes available for free — worth the extra pass, or does reordering
+   never occur because bullets are spoken in order by construction? (b) The
+   window is the bullet's own token count, which is a guess at spoken span. Should
+   it be derived instead from the gaps between matched tokens?
 
 5. **TTS provider risk (§8).** Is pinning plus a CI health probe the right level
    of defence for an unofficial wrapper, or should the backend seam land before
