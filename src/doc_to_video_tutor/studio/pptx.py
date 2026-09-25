@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from pptx.dml.color import RGBColor
@@ -213,6 +214,21 @@ def _paginate_by_height(page: dict, budget: float) -> list[dict]:
         out.append(clone)
         start = end
     return out
+
+
+def _strip_field_leak(text: str) -> str:
+    """Remove a trailing JSON field name from text bound for a slide.
+
+    The 7B sometimes emits "...shuruwat karte hai. opening", leaking the key
+    into the spoken and displayed line. The plan pipeline cleans this, but the
+    deck is built from saved plans too, so the renderer applies the same rule
+    rather than assuming the input is already clean.
+    """
+    cleaned = re.sub(
+        r"\s*\.\s*(?:opening|closing|prompt_end|text|line|value|content)\s*$",
+        "", str(text), flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+(?:opening|closing|prompt_end)\s*$", "", cleaned,
+                  flags=re.IGNORECASE).strip()
 
 
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
@@ -429,7 +445,15 @@ def build_pptx(plan: dict, out_path: Path) -> None:
     _ppt_set_bg(s)
     _ppt_slide_chrome(s, "LESSON", plan.get("title", "Lesson"),
                       f"1 / {deck_total}")
-    _ppt_textbox(s, 0.42, 1.7, 12.4, 1.8, plan.get("opening", ""), 18,
+    # Defence in depth for field-name leakage. The plan pipeline sanitises the
+    # opening, but the deck is a separate artifact built from a *saved* plan as
+    # well as a live one, and a saved plan can predate the sanitiser or come from
+    # elsewhere. Observed on a deck rendered straight from a saved plan: the
+    # literal JSON key "opening" was printed on the title slide, in front of a
+    # learner. The renderer must not trust upstream hygiene for text it puts on a
+    # slide, so it strips it again here.
+    _ppt_textbox(s, 0.42, 1.7, 12.4, 1.8,
+                 _strip_field_leak(str(plan.get("opening", ""))), 18,
                  (150, 158, 175), wrap=True)
 
     for i, scene in enumerate(page_scenes):

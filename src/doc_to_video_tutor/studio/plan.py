@@ -1259,6 +1259,40 @@ def _annotate_source_chunks(plan: dict, content: str) -> int:
     plan["source_assignment"] = records
     return annotated
 
+def _dedupe_visual_diagrams(plan: dict) -> int:
+    """Drop a diagram that repeats one an earlier scene already showed.
+
+    Layer A already refuses to let a narration sentence be spoken twice across
+    scenes, on the grounds that a repeat teaches nothing the first telling did
+    not. The same argument applies to a visual, and it was not applied: on
+    `mod03_gates_v012_002` three of nine scenes carried the identical
+    `[Run Value] --> [Delta vs Baseline] --> [Absolute/Relative Threshold]`
+    diagram and two more carried the same gate/guardrail/info chain, so a learner
+    saw the same picture five times.
+
+    The repeat is removed from the later scene only, so the teaching content
+    stays and the first, fullest use of the diagram is kept. Order-independent:
+    the earliest scene keeps it, which is the one a viewer meets first.
+    """
+    from .text import _nar_tokens
+
+    seen: set[frozenset[str]] = set()
+    dropped = 0
+    for scene in plan.get("scenes", []):
+        diagram = str(scene.get("visual_diagram") or "").strip()
+        if not diagram:
+            continue
+        signature = frozenset(_nar_tokens(diagram))
+        if not signature:
+            continue
+        if signature in seen:
+            scene.pop("visual_diagram", None)
+            dropped += 1
+        else:
+            seen.add(signature)
+    return dropped
+
+
 def _scene_problem_map(plan: dict, topics: list[str],
                        source_bigrams: set[tuple[str, str]],
                        source_tokens: set[str],
@@ -1730,6 +1764,13 @@ def plan_lesson(content: str, target_minutes: float,
         _persist_protected_trigrams(plan, content)
     protected = _protected_terms(plan)
     _annotate_source_chunks(plan, content)
+    # Same rule Layer A applies to repeated narration sentences, applied to the
+    # visual channel: a diagram repeated across scenes teaches nothing the first
+    # telling did not.
+    _deduped_diagrams = _dedupe_visual_diagrams(plan)
+    if _deduped_diagrams:
+        print(f"\n  [1/5] dropped {_deduped_diagrams} repeated diagram(s) "
+              f"already shown on an earlier scene.", end="", flush=True)
     # Phase 2 Pass B: the planner left narration blank, so a short dedicated
     # narration pass writes the whole spoken track. On failure the
     # deterministic chain below rebuilds narration from scene fields instead -

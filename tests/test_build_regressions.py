@@ -470,3 +470,67 @@ def test_dropped_required_content_is_reported_never_silent() -> None:
     finally:
         P._audit_layout = original
     assert notes == ["sentinel"], "the audit must still run"
+
+
+# --- content defects found in a rendered deck ----------------------------
+#
+# Reported against mod03_gates_v012_006.pptx. Two classes, both visible to a
+# learner and neither caught by the layout audit, which only knows about
+# geometry.
+
+def test_renderer_strips_field_name_leaks_from_the_opening() -> None:
+    """The deck must not trust upstream hygiene for text it puts on a slide.
+
+    The plan pipeline sanitises the opening, but the deck is also built from
+    saved plans, and a saved plan can predate the sanitiser. Rendering straight
+    from a saved plan printed the literal JSON key "opening" on the title
+    slide.
+    """
+    from doc_to_video_tutor.studio.pptx import _strip_field_leak
+
+    leaked = "Chaliye regression samajh ke shuruwat karte hai. opening"
+    assert _strip_field_leak(leaked) == (
+        "Chaliye regression samajh ke shuruwat karte hai")
+    assert not _strip_field_leak("...shuruwat karte hai opening").endswith(
+        "opening")
+    # And a legitimate ending is left alone.
+    keep = "Baseline snapshot and compare, then diff every new run"
+    assert _strip_field_leak(keep) == keep
+
+
+def test_repeated_diagrams_are_dropped_from_later_scenes() -> None:
+    """A visual repeated across scenes teaches nothing the first telling did not.
+
+    Layer A already refuses a repeated narration sentence across scenes; the same
+    rule was missing on the visual channel, so three of nine scenes carried the
+    identical Run Value -> Delta vs Baseline diagram and two more carried the
+    same gate/guardrail/info chain.
+    """
+    from doc_to_video_tutor.studio.plan import _dedupe_visual_diagrams
+
+    chain = "[A] ---> [B] ---> [C]"
+    plan = {"scenes": [
+        {"visual_diagram": chain},          # first use is kept
+        {"visual_diagram": chain},          # repeat dropped
+        {"visual_diagram": "[X] ---> [Y]"}, # distinct is kept
+        {"visual_diagram": "[X] ---> [Y]"}, # repeat dropped
+        {},                                 # no diagram, untouched
+    ]}
+    assert _dedupe_visual_diagrams(plan) == 2
+    assert plan["scenes"][0]["visual_diagram"] == chain
+    assert "visual_diagram" not in plan["scenes"][1]
+    assert plan["scenes"][2]["visual_diagram"] == "[X] ---> [Y]"
+    assert "visual_diagram" not in plan["scenes"][3]
+    assert "visual_diagram" not in plan["scenes"][4]
+
+
+def test_diagram_dedup_is_token_based_not_string_based() -> None:
+    """Punctuation and spacing must not make a repeat look like a new diagram."""
+    from doc_to_video_tutor.studio.plan import _dedupe_visual_diagrams
+
+    plan = {"scenes": [
+        {"visual_diagram": "[A] ---> [B]"},
+        {"visual_diagram": "[A]  --->   [B]"},
+    ]}
+    assert _dedupe_visual_diagrams(plan) == 1
+    assert "visual_diagram" not in plan["scenes"][1]
