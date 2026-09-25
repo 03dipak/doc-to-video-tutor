@@ -286,7 +286,7 @@ def test_report_measured_duration_prefers_measurement(monkeypatch, capsys) -> No
     out = capsys.readouterr().out
     assert "3.72 min measured" in out
     assert "93%" in out
-    assert "[PASS]" in out
+    assert "[OK]" in out
     assert "lesson_duration_short" not in out
 
 
@@ -351,7 +351,11 @@ def test_duration_verdict_is_symmetric(monkeypatch, capsys) -> None:
     video._report_measured_duration([Path(f"c{i}.mp3") for i in range(10)],
                                     {"target_minutes": 4.0})
     out = capsys.readouterr().out
-    assert "[FAIL]" in out
+    # Advisory bands must not be labelled with a severity word: the build does
+    # not stop, so calling it FAIL is the mirror of a soft finding that blocks.
+    assert "[LONG]" in out
+    assert "[FAIL]" not in out
+    assert "advisory" in out
     assert "lesson_duration_critical_long" in out
     # And the remedy differs by side: never pad a short one.
     assert "trim" in video._duration_verdict(1.20)[1]

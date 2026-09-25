@@ -327,23 +327,28 @@ def _duration_verdict(ratio: float) -> tuple[str, str]:
     fix, and auto-trimming narration would risk the grounding the gates exist to
     protect.
     """
+    # Labels are descriptive, not severities. These bands are advisory - the
+    # remedy is source-grounded teaching, which no mechanical step can supply -
+    # so the earlier version printing "[FAIL]" and then carrying on to write the
+    # deck was incoherent, the mirror image of the soft finding that used to
+    # announce "proceeding anyway" and then refuse the build.
     if ratio < _DURATION_BAND_LOW:
-        return "FAIL", ("lesson_duration_critical_short: the render reaches only "
+        return "SHORT", ("lesson_duration_critical_short: the render reaches only "
                         f"{ratio:.0%} of the declared target, so the lesson does "
                         "not meet its stated format")
     if ratio < _DURATION_BAND_OK:
-        return "WARN", ("lesson_duration_short: the render is materially under "
+        return "SHORT", ("lesson_duration_short: the render is materially under "
                         f"target at {ratio:.0%}. Add source-grounded teaching - "
                         "never padding")
     if ratio > _DURATION_BAND_HIGH:
-        return "FAIL", ("lesson_duration_critical_long: the render reaches "
+        return "LONG", ("lesson_duration_critical_long: the render reaches "
                         f"{ratio:.0%} of the declared target, which is a pacing "
                         "defect rather than extra teaching")
     if ratio > _DURATION_BAND_OK_HIGH:
-        return "WARN", ("lesson_duration_long: the render runs long at "
+        return "LONG", ("lesson_duration_long: the render runs long at "
                         f"{ratio:.0%} of target; trim selectively rather than "
                         "across the board")
-    return "PASS", ""
+    return "OK", ""
 
 
 def _report_measured_duration(paths: list[Path], script: dict) -> None:
@@ -371,7 +376,8 @@ def _report_measured_duration(paths: list[Path], script: dict) -> None:
     print(f"  duration  : {measured_min:.2f} min measured vs {target:.2f} min "
           f"target = {ratio:.0%} [{verdict}]")
     if finding:
-        print(f"  [{verdict}] {finding}")
+        print(f"  [{verdict}] {finding} (advisory - this does not block the "
+              f"build; the fix is source-grounded teaching, not padding)")
 
 
 def _audit_clip_health(paths: list[Path]) -> list[str]:

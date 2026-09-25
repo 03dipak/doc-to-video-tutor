@@ -1178,3 +1178,57 @@ Chasing this also surfaced a 0.02 in under-reservation in the slide title: at
 The general rule: **a checker that normalises away the very structure it is
 checking cannot detect it.** `strip()` is the right call for comparing content
 and the wrong call for comparing geometry.
+
+### 22.11 The duration gate fired for the first time, and it was right
+
+`mod03_gates_v012_011` measured **3.07 min against a 4.0 min target = 77 %**, the
+first time the band added in §22.5 has fired. It is a **true positive**, unlike the
+phantom of §22.6:
+
+| | measured | verdict |
+|---|---:|---|
+| `mod03_gates_v012_011` | 77 % | genuinely short — 299 words, needs ~390 |
+| `mod03_gates_v012_009` | 97 % | fine |
+| `mod03_gates_v012_007` | 112 % | fine |
+
+Every per-scene gate passed: seven of ten clips cleared the 25-word floor, and the
+shortest scene clip was 23 words against a 25-word warning line. So a lesson can
+satisfy every scene-level check and still be a quarter short, which is exactly
+what both external reviews said a per-scene floor cannot do.
+
+Two defects around the report, both severity-messaging:
+
+1. It printed `[FAIL]` and then carried on to write the deck and the audio. The
+   bands are advisory — the remedy is source-grounded teaching, which no
+   mechanical step can supply — so a FAIL that does not fail is the mirror image
+   of the soft finding in §20.2 defect 20 that announced "proceeding anyway" and
+   then refused the build. The labels are now descriptive (`SHORT` / `LONG` /
+   `OK`) and say they are advisory, so no severity word is claimed that the code
+   does not enforce.
+
+2. `LOUDNESS_WPM` is a projection and drifts per build: 103.1, 107.8 and now
+   97.5 words/min have all been measured, so the constant is roughly ±5 %. The
+   pre-audio estimate on this build read 2.9 min against 3.07 measured. That is
+   acceptable for a *pre*-audio hint and is precisely why the measured report is
+   the authority; the constant is not, and must not be tightened into a
+   precision it does not have.
+
+### 22.11.1 A second duration check was tried and removed
+
+A plan-side density signal was added so a thin lesson would be visible before the
+provider was called, then removed after measuring it. Scene narration
+systematically undercounts the spoken track by 26–37 %, because the spoken title
+heads and the final takeaways clip are not in `scene["narration"]`:
+
+| build | plan narration | actually spoken | measured |
+|---|---:|---:|---:|
+| `v012_011` | 238 | 299 | 77 % |
+| `v012_009` | 293 | 370 | 97 % |
+| `v012_007` | 367 | 504 | 112 % |
+
+The estimate therefore turned a 97 % lesson into a 71 % warning — a false positive
+on a good build. It was removed rather than calibrated, because the measured
+report already performs this check correctly, and adding a second, less accurate
+definition of the same rule is the exact policy-drift pattern in §22.2 that has
+produced six defects in this pipeline. A duplicate check that is wrong is worse
+than no duplicate check.
