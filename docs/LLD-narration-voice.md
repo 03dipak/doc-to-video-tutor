@@ -1002,6 +1002,7 @@ render, not by inspection.
 | scoped `zoompan` | **open** | not started |
 | SVG diagram backend | **open** | not started |
 | TTS backend seam + capability model | **open** | accepted in §22.6, not started |
+| `pipeline-architect` review agent | done | third read-only reviewer over build artifacts, scoped to cross-artifact consistency (lineage, timing, deck-vs-script, provenance, reproducibility) so it does not duplicate graphic-reviewer or tester. Its checklist corrected on first run: timing monotonicity must be checked per clip, and the VTT span must be compared against audio + inter-scene pauses |
 | `SourceEvidenceBundle` for repair | **partly done** | `source_assignment` now carries heading, content digest and score per scene, and a weak match attaches nothing (§20.2 defect 4). The remaining part is making repair read that record rather than the raw `source_chunk` string. |
 
 The two still-open M0 items (backend seam, retry) are the reason M0 is not yet
