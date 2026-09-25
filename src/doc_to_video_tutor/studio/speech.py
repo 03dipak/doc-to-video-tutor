@@ -107,12 +107,29 @@ class TtsFinding:
     message: str
 
 
+_SNAKE_CASE_RE = re.compile(r"(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])")
+
+
+def expand_snake_case(text: str) -> str:
+    """Speak unmapped snake_case identifiers as separate words.
+
+    Pronunciation rules are an explicit dictionary, so any identifier the model
+    invents that is not in it (``baseline_report``, ``golden_set_path``, ...)
+    keeps its underscore and reaches the voice as a code fragment. Rather than
+    adding a rule per identifier, the generic fallback runs after the dictionary
+    and splits whatever is left: ``baseline_report.json`` becomes
+    "baseline report dot json". Runs after rule expansion so a mapped identifier
+    such as ``schema_version`` is already spoken and never reaches this pass.
+    """
+    return _SNAKE_CASE_RE.sub(" ", text)
+
+
 def speech_expand(text: str, rules: tuple[PronunciationRule, ...]) -> str:
     """Expand written tokens to speakable words (longest match first)."""
     ordered = sorted(((r.written, r.spoken, r.word_boundary) for r in rules),
                      key=lambda item: len(item[0]), reverse=True)
     if not ordered:
-        return text
+        return expand_snake_case(text)
     spoken_by_group: dict[str, str] = {}
     parts: list[str] = []
     for idx, (w, s, wb) in enumerate(ordered):
@@ -123,7 +140,7 @@ def speech_expand(text: str, rules: tuple[PronunciationRule, ...]) -> str:
     def _repl(m: re.Match[str]) -> str:
         idx = m.lastindex
         return spoken_by_group[str(idx - 1)] if idx is not None else m.group(0)
-    return combined.sub(_repl, text)
+    return expand_snake_case(combined.sub(_repl, text))
 
 
 def _flatten_parentheses(text: str) -> str:

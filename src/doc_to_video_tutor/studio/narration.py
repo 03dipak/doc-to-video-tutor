@@ -10,10 +10,12 @@ from .llm import _ask_llm_stable, _bounded_content, planner_output_budget
 from .speech import audit_tts_script, build_tts_script
 from .text import (
     _entity_tokens,
+    _has_non_latin_script,
     _nar_3grams_t,
     _nar_3grams_t_ordered,
     _nar_gram_key,
     _nar_tokens,
+    _strip_source_citations,
 )
 from .voice import _MHE_VOICE, NarrationVoice, _opener_module_name
 
@@ -377,7 +379,8 @@ def _repair_unsafe_narrations(plan: dict,
         grams = _narration_3grams(str(sc.get("narration", "")))
         if not (grams & banned_set):
             continue
-        rebuilt = _rebuild_scene_narration(sc, idx, scenes, voice)
+        rebuilt = _rebuild_scene_narration(sc, idx, scenes, voice,
+                                           blocked_grams=frozenset(banned_set))
         if not rebuilt or rebuilt == str(sc.get("narration", "")):
             continue
         sc["narration"] = rebuilt
@@ -435,8 +438,10 @@ def _repair_thin_narrations(plan: dict, voice: NarrationVoice | None = None,
         floor = _NARR_MIN_TOKENS
         if str(sc.get("source_chunk", "")).strip():
             floor = _NARR_MIN_TOKENS + 6
+        banned, _ = _narration_repeat_report(plan, protected)
         rebuilt = _rebuild_scene_narration(sc, idx - 1, scenes, voice,
-                                           min_tokens=floor)
+                                           min_tokens=floor,
+                                           blocked_grams=frozenset(banned))
         if not rebuilt or rebuilt == nar:
             continue
         sc["narration"] = rebuilt
@@ -467,18 +472,26 @@ def _thin_narration(nar: str, sc: dict, voice: NarrationVoice) -> bool:
 
 def _rebuild_scene_narration(sc: dict, idx: int, scenes: list[dict],
                              voice: NarrationVoice,
-                             min_tokens: int = _NARR_MIN_TOKENS) -> str:
+                             min_tokens: int = _NARR_MIN_TOKENS,
+                             blocked_grams: frozenset[str] | None = None
+                             ) -> str:
     """Deterministic narration for one scene from its validated fields.
 
     Rebuild the spoken track as: opener + design_decision lead + distinct
     bullets. The title is NOT re-spoken here - ``build_tts_script`` prepends the
     spoken title head itself, so echoing it in the narration would trip the
     fragment/repeat gates. Only the voice's words and the scene's OWN content
-    are used (no hardcoded Hinglish grammar anywhere in Layer A), and any piece
-    whose 3-grams collide with another scene's narration is skipped, so the
-    rebuild cannot invent a new banned repeat. Returns "" if nothing usable.
+    are used (no hardcoded Hinglish grammar anywhere in Layer A).
+
+    Every accepted fragment's 3-grams are folded into the collision set as they
+    are spoken, so a later fragment is skipped when it repeats an earlier one
+    *inside the same scene*. ``blocked_grams`` seeds the set with the plan's
+    currently banned phrases. Together these make the rebuild repeat-free by
+    construction: without them a scene whose own fields contain the repetition
+    rebuilds to the same damaged text, the caller treats that as unrepaired, and
+    the repeat can never converge.
     """
-    other_grams: set[str] = set()
+    other_grams: set[str] = set(blocked_grams or frozenset())
     for j, o in enumerate(scenes):
         if j == idx:
             continue
@@ -490,21 +503,29 @@ def _rebuild_scene_narration(sc: dict, idx: int, scenes: list[dict],
     opener = _pick_opener(voice, idx, module, other_grams)
 
     parts: list[str] = [opener] if opener else []
+    if opener:
+        other_grams |= _narration_3grams(opener)
     dd = str(sc.get("design_decision", "")).strip().strip(".!? ")
     if dd and not (_narration_3grams(dd) & other_grams):
         lead = voice.dd_leads[idx % len(voice.dd_leads)].strip()
-        parts.append(f"{lead}{dd}.")
+        spoken_dd = f"{lead}{dd}."
+        parts.append(spoken_dd)
+        other_grams |= _narration_3grams(spoken_dd)
     for b in (sc.get("bullets") or [])[:5]:
         bt = str(b).strip().strip(".!? ")
-        if not bt or (_narration_3grams(bt) & other_grams):
+        if not bt:
+            continue
+        bt_grams = _narration_3grams(bt)
+        if bt_grams & other_grams:
             continue
         parts.append(f"{bt}.")
+        other_grams |= bt_grams
     nar = _clean_narration(" ".join(p.strip() for p in parts if p.strip()))
     if len(_nar_tokens(nar)) < min_tokens:
         # Phase-3 hydration: when a scene's own fields can't reach the floor,
         # pull real teaching sentences straight from the source docs (the
         # scene's annotated source_chunk). Each sentence is collision-checked
-        # against every other scene's narration so the rebuild cannot invent a
+        # against everything already spoken so the rebuild cannot invent a
         # new banned repeat. Real doc prose is denser and more unique than the
         # structural template, so this resolves the truly content-starved
         # scene class instead of leaving it for a whole-plan LLM resample.
@@ -512,6 +533,7 @@ def _rebuild_scene_narration(sc: dict, idx: int, scenes: list[dict],
             if _narration_3grams(s) & other_grams:
                 continue
             parts.append(s)
+            other_grams |= _narration_3grams(s)
             nar = _clean_narration(" ".join(p.strip() for p in parts if p.strip()))
             if len(_nar_tokens(nar)) >= min_tokens:
                 break
@@ -535,14 +557,62 @@ def _pick_opener(voice: NarrationVoice, start_idx: int, module: str,
         if not cand or not (_narration_3grams(cand) & other_grams):
             return cand
     return pool[start_idx % len(pool)].format(m=module).strip(" -")
+_SOURCE_LABEL_RE = re.compile(
+    r"^\s*(?:plain\s+words|why\s+[\w\s]{0,20}?\s+chose\s+it|interview\s+line"
+    r"|lld\s+ref|source|note)\s*:\s*", re.IGNORECASE)
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+_MD_RESIDUE_RE = re.compile(r"[*#|~]|``")
+_UNSAFE_SPOKEN_RE = re.compile(r"[^A-Za-z0-9\s.,:;!?()\[\]/%+=&'\u2019-]")
+
+
+def _clean_spoken_prose(text: str) -> str:
+    """Reduce a markdown fragment to speakable ASCII/Latin prose."""
+    s = _UNSAFE_SPOKEN_RE.sub(" ", text)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[:;,]\s*(?=[.!?])", "", s)
+    s = re.sub(r"\.{2,}", ".", s)
+    s = re.sub(r"\(\s*\)", "", s)
+    s = re.sub(r"\(\s*[,;]?", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"\s+([.,;:!?])", r"\1", s)
+    return s.strip(" -:;,")
+
+
 def _source_sentences(text: str) -> list[str]:
-    """Complete, teachable prose sentences (>=8 words) from a source excerpt."""
-    out: list[str] = []
-    for s in re.split(r"(?<=[.!?])\s+", text.strip()):
-        s = s.strip()
-        if len(_nar_tokens(s)) >= 8:
-            out.append(s)
-    return out
+    """Complete, teachable prose sentences (>=8 words) from a source excerpt.
+
+    Source excerpts are authored as markdown: list markers, bold labels,
+    backticked identifiers, em-dash sub-clauses, emoji callouts and document
+    labels such as "Plain words:". Speaking that text verbatim leaks authoring
+    structure into the voice-over, so the excerpt is normalized into prose
+    first: inline dash sub-clauses that introduce a new list item become
+    sentence boundaries, markdown emphasis and backticks are removed, list
+    markers are stripped, document
+    labels are dropped, and any character the voice cannot speak is deleted.
+    Only then is the text split into sentences. A sentence must carry at least
+    eight tokens to be kept; when that yields fewer than two candidates the bar
+    relaxes to five, so a content-starved scene can still be hydrated from real
+    source prose instead of being abandoned.
+    """
+    body = _strip_source_citations(str(text))
+    body = body.replace("`", "")
+    body = re.sub(r"(?<=:)\s+[-–—]\s+", ". ", body)
+    body = re.sub(r"\s+[-–—]\s+(?=(?:[-*+]|\d+[.)])\s)", ". ", body)
+    body = re.sub(r"\s+/\s+", " or ", body)
+    scored: list[tuple[str, int]] = []
+    for raw in re.split(r"(?<=[.!?])\s+", body.strip()):
+        s = raw.replace("*", "").replace("~", "").strip()
+        s = _LIST_MARKER_RE.sub("", s)
+        s = _SOURCE_LABEL_RE.sub("", s)
+        s = _LIST_MARKER_RE.sub("", s.strip())
+        s = _clean_spoken_prose(s)
+        if _MD_RESIDUE_RE.search(s) or _has_non_latin_script(s):
+            continue
+        scored.append((s, len(_nar_tokens(s))))
+    keep = [s for s, n in scored if n >= 8]
+    if len(keep) < 2:
+        keep = [s for s, n in scored if n >= 5]
+    return keep
 def _dedupe_narration_templates(plan: dict, quiet: bool = False,
                                 voice: NarrationVoice | None = None,
                                 protected: frozenset[str] | None = None) -> int:

@@ -261,6 +261,20 @@ def _long_narration(kind: str, value: str) -> str:
             f"and a {kind} value for the {value} unit to compare.")
 
 
+def test_source_sentences_strip_markdown_labels_and_symbols() -> None:
+    chunk = ("- **Plain words:** these three kinds control what the evidence "
+             "*means*: - **gate**: hard contract — regression = **FAIL**, merge "
+             "blocked. - **guardrail:** soft target ⚠️ (quality/latency drift).")
+    got = _source_sentences(chunk)
+    assert got
+    joined = " ".join(got)
+    assert "Plain words" not in joined
+    for residue in ("*", "#", "⚠"):
+        assert residue not in joined
+    assert ":." not in joined and ".." not in joined
+    assert "hard contract" in joined
+
+
 def test_narrations_from_json_parses_fenced_array() -> None:
     raw = ("here is the track\n```json\n[{\"scene\": 1, \"narration\": \""
            + _long_narration("unit", "tolerance") + "\"}, "

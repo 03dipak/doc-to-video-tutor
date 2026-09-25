@@ -438,6 +438,49 @@ def _grounding_issues(plan: dict, source_bigrams: set[tuple[str, str]],
         if t and not _anchored(str(t)):
             issues.append(f"takeaway {j} ungrounded: {str(t)[:64]!r}")
     return issues
+def _drop_repeated_bullet_clauses(plan: dict) -> int:
+    """Drop a later bullet that repeats a clause already spoken by an earlier
+    bullet in the SAME scene.
+
+    Exact-duplicate removal (``_dedupe_plan_bullets``) and near-duplicate
+    detection against takeaways (``_near_dupe_bullets``) both miss the case the
+    free model actually produces: two bullets that are individually distinct but
+    share the same trailing clause, e.g.
+
+        "Info: recorded for provenance, CI gate ney pass nahi karne ka."
+        "Info: never breaks a build, kyunki CI gate ney pass nahi karne ka."
+
+    Whole-bullet similarity stays low, but the shared run is long enough to become
+    a banned repeated trigram as soon as the deterministic narration rebuild
+    speaks both bullets. Removing the later bullet at the source fixes the slide
+    and the narration in one deterministic pass. The rule is deliberately
+    conservative: a run of four or more consecutive canonical tokens must be
+    shared, so "gate: hard fail" and "gate: soft review" are untouched.
+    """
+    run = 4
+    dropped = 0
+    for sc in plan.get("scenes", []):
+        original = [b for b in (sc.get("bullets") or [])]
+        kept: list[str] = []
+        kept_windows: set[tuple[str, ...]] = set()
+        scene_dropped = 0
+        for bullet in original:
+            tokens = tuple(_nar_tokens(str(bullet)))
+            if not tokens:
+                scene_dropped += 1
+                continue
+            windows = {tokens[i:i + run] for i in range(len(tokens) - run + 1)}
+            if windows & kept_windows:
+                scene_dropped += 1
+                continue
+            kept.append(bullet)
+            kept_windows |= windows
+        if scene_dropped:
+            sc["bullets"] = kept
+            dropped += scene_dropped
+    return dropped
+
+
 def _drop_ungrounded_slide_text(plan: dict,
                                 source_bigrams: set[tuple[str, str]],
                                 source_tokens: set[str]) -> int:
@@ -450,8 +493,10 @@ def _drop_ungrounded_slide_text(plan: dict,
     and _sanitize_design_decisions, this prunes that degenerate output in place
     so the hard grounding gate converges without spending another LLM call.
 
-    Only *drop*. Never rewrites. Titles are left alone (a bad title is handled
-    by the placeholder-title fixer, not by deleting it).
+    Only *drop*, except for titles, which cannot be deleted. An ungrounded title
+    is therefore re-derived from the scene's own grounded material (its
+    ``topic`` first, then its first grounded bullet), so the hard grounding gate
+    converges without spending another LLM call.
     """
     if not source_bigrams or not source_tokens:
         return 0
@@ -469,6 +514,10 @@ def _drop_ungrounded_slide_text(plan: dict,
         shared = tokens & source_tokens
         return len(shared) >= 3 or (len(shared) >= 2 and any(len(t) > 6 for t in shared))
 
+    def _clean_title(text: str) -> str:
+        value = re.sub(r"^\s*m\d+\s*[-.:]?\s*", "", str(text), flags=re.IGNORECASE)
+        return " ".join(value.split())[:44].strip(" -.:,")
+
     dropped = 0
     for sc in plan.get("scenes", []):
         for field in ("bullets", "takeaways"):
@@ -485,6 +534,24 @@ def _drop_ungrounded_slide_text(plan: dict,
     kept_tk = [t for t in plan_tk if _anchored(t)]
     dropped += len(plan_tk) - len(kept_tk)
     plan["takeaways"] = kept_tk
+    used_titles = {str(sc.get("title", "")).strip().casefold()
+                   for sc in plan.get("scenes", [])}
+    for sc in plan.get("scenes", []):
+        title = str(sc.get("title", "")).strip()
+        if not title or _anchored(title):
+            continue
+        candidates = [sc.get("topic"),
+                      *(sc.get("bullets") or []), sc.get("design_decision", "")]
+        for candidate in candidates:
+            value = _clean_title(str(candidate or ""))
+            if (len(value) < 8 or not _anchored(value)
+                    or value.casefold() in used_titles):
+                continue
+            sc["title"] = value
+            used_titles.discard(title.casefold())
+            used_titles.add(value.casefold())
+            dropped += 1
+            break
     _paginate_plan_slides(plan)
     return dropped
 def _repeated_bullets(plan: dict) -> list[str]:
@@ -1353,6 +1420,11 @@ def plan_lesson(content: str, target_minutes: float,
     # That is a loud, recorded repair - not a silent clamp. Only counts outside
     # the recoverable range (<5 or >12) can still surface here as manual gates.
     _dedupe_plan_bullets(plan)
+    clause_dropped = _drop_repeated_bullet_clauses(plan)
+    if clause_dropped:
+        print(f"\n  [1/5] dropped {clause_dropped} bullet(s) that repeated a "
+              f"clause from an earlier bullet in the same scene.", end="",
+              flush=True)
     pruned = _prune_bullet_takeaway_echo(plan)
     if pruned:
         print(f"\n  [1/5] pruned {pruned} bullet(s) that echoed a takeaway.",

@@ -33,6 +33,93 @@ def _banned(plan: dict) -> list[str]:
     return S._narration_repeat_report(plan, S._protected_terms(plan))[0]
 
 
+def test_rebuild_skips_bullet_repeating_an_earlier_bullet() -> None:
+    scene = {
+        "title": "Verdict semantics",
+        "section": "What Is This",
+        "design_decision": "",
+        "bullets": [
+            "Info is recorded for provenance, CI gate ney pass nahi karne ka",
+            "Info never breaks a build, kyunki CI gate ney pass nahi karne ka",
+        ],
+    }
+    scenes = [scene]
+    rebuilt = S._rebuild_scene_narration(scene, 0, scenes, S._MHE_VOICE)
+    assert "recorded for provenance" in rebuilt
+    assert rebuilt.count("pass nahi karne ka") == 1
+
+
+def test_unsafe_repair_converges_when_scene_fields_hold_the_repeat() -> None:
+    tail = "CI gate ney pass nahi karne ka"
+    plan = {
+        "opening": "",
+        "takeaways": [],
+        "scenes": [
+            {"section": "What Is This", "title": "Kind equals verdict semantics",
+             "topic": "Kind equals verdict semantics",
+             "source_refs": ["source document"], "design_decision": "",
+             "bullets": [
+                 "Gate is a hard contract that blocks the merge on regression",
+                 f"Info is recorded for provenance, {tail}",
+                 f"Info never breaks a build, kyunki {tail}",
+             ],
+             "source_chunk": (
+                 "These three kinds control what the evidence means: the gate "
+                 "is a hard contract, the guardrail is a soft target, and info "
+                 "is recorded only for provenance and never a verdict."),
+             "narration": (
+                 "Yahan hum ek important piece samjhte hain. "
+                 f"Info is recorded for provenance, {tail}. "
+                 f"Info never breaks a build, kyunki {tail}.")},
+            {"section": "Example", "title": "Tolerance and the two units",
+             "topic": "Tolerance and the two units",
+             "source_refs": ["source document"], "design_decision": "",
+             "bullets": ["Absolute units give a fixed delta for a metric"],
+             "narration": (
+                 "Ab chaliye tolerance dekhte hain. Absolute units ek fixed "
+                 "delta dete hain aur relative units percentage dete hain.")},
+        ],
+    }
+    protected = S._protected_terms(plan)
+    assert _banned(plan), "fixture must reproduce the repeated-clause failure"
+    S._enforce_unique_narration_trigrams(plan, quiet=True, protected=protected)
+    repaired = S._repair_unsafe_narrations(plan, voice=S._MHE_VOICE,
+                                           protected=protected, quiet=True)
+    assert repaired == 1
+    assert _banned(plan) == []
+    assert not [p for p in S._render_blocking_problems(plan, voice=S._MHE_VOICE)
+                if "banned" in p or "repeat" in p]
+
+
+def test_drop_repeated_bullet_clauses_keeps_distinct_bullets() -> None:
+    plan = {"scenes": [{
+        "title": "Kinds", "narration": "",
+        "bullets": [
+            "Gate is a hard contract that blocks the merge when a metric fails",
+            "Info is a record only signal that never blocks a merge by existing",
+            "Guardrail is a soft review target for quality and latency drift",
+        ],
+    }]}
+    assert S._drop_repeated_bullet_clauses(plan) == 0
+    assert len(plan["scenes"][0]["bullets"]) == 3
+
+    plan["scenes"][0]["bullets"].append(
+        "The nightly lane is informational only because a live judge never "
+        "decides whether the merge should be blocked")
+    assert S._drop_repeated_bullet_clauses(plan) == 0
+
+    plan["scenes"][0]["bullets"] = [
+        "Info is recorded for provenance, CI gate ney pass nahi karne ka",
+        "Info never breaks a build, kyunki CI gate ney pass nahi karne ka",
+        "Gate blocks the merge when a metric fails its hard tolerance",
+    ]
+    assert S._drop_repeated_bullet_clauses(plan) == 1
+    assert plan["scenes"][0]["bullets"] == [
+        "Info is recorded for provenance, CI gate ney pass nahi karne ka",
+        "Gate blocks the merge when a metric fails its hard tolerance",
+    ]
+
+
 def test_repeated_filler_is_removed_across_scenes() -> None:
     plan = _plan_with([
         "We must compare the baseline carefully in this lesson before we trust "
@@ -369,6 +456,7 @@ def test_filter_takeaways_to_retained_spares_grounded_takeaways() -> None:
 def _grounded_plan() -> tuple[dict, set, set]:
     plan = _scene_plan(3)
     for i, sc in enumerate(plan["scenes"], 1):
+        sc["title"] = f"Scene {i} distinct idea"
         sc["bullets"] = [f"scene {i} talks about one distinct idea in the lesson."]
     del plan["takeaways"]
     bg = {("scene", "one"), ("one", "distinct"), ("distinct", "idea"),
@@ -393,14 +481,18 @@ def test_drop_ungrounded_slide_text_drops_drift_keeps_anchored() -> None:
                for i in S._grounding_issues(plan, bg, tk))
 
 
-def test_drop_ungrounded_slide_text_spares_title_and_short_text() -> None:
+def test_drop_ungrounded_slide_text_retitles_only_when_needed() -> None:
     plan, bg, tk = _grounded_plan()
-    plan["scenes"][0]["title"] = "regression gates metric registry precedence"
-    plan["scenes"][0]["bullets"] = ["ok"]
-    dropped = S._drop_ungrounded_slide_text(plan, bg, tk)
-    assert dropped == 0
-    assert plan["scenes"][0]["title"] == "regression gates metric registry precedence"
-    assert plan["scenes"][0]["bullets"] == ["ok"]
+    assert S._grounding_issues(plan, bg, tk) == []
+    assert S._drop_ungrounded_slide_text(plan, bg, tk) == 0
+    assert plan["scenes"][0]["title"] == "Scene 1 distinct idea"
+
+    drifted, bg2, tk2 = _grounded_plan()
+    drifted["scenes"][0]["title"] = "Totally invented heading nobody wrote"
+    drifted["scenes"][0]["topic"] = "one distinct idea in the lesson"
+    assert S._drop_ungrounded_slide_text(drifted, bg2, tk2) == 1
+    assert drifted["scenes"][0]["title"] == "one distinct idea in the lesson"
+    assert S._grounding_issues(drifted, bg2, tk2) == []
 
 
 def _unsafe_plan() -> (tuple)[dict, dict]:

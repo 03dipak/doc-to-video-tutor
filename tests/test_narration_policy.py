@@ -248,3 +248,17 @@ def test_saved_source_protected_trigrams_reused_from_plan() -> None:
     assert "llama3 tokenizer for" in prot
     assert "llama3 tokenizer for" not in banned
     assert "must test the" in banned
+
+
+def test_narration_under_run_warning_flags_short_lessons() -> None:
+    from doc_to_video_tutor.studio.cli import narration_under_run_warning
+
+    # 373 spoken words at the 135 WPM model is ~2.8 min against a 4.0 min target.
+    warning = narration_under_run_warning(373, 4.0)
+    assert warning is not None
+    assert "under-run" in warning
+    assert "69%" in warning
+    # A lesson that meets the target must not warn.
+    assert narration_under_run_warning(578, 4.0) is None
+    # No target means nothing to compare against.
+    assert narration_under_run_warning(373, 0.0) is None

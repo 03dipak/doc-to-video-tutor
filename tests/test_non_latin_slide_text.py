@@ -166,12 +166,45 @@ def test_drop_ungrounded_slide_text_drops_devanagari_bullet():
     bg = S._content_ngrams(src)
     tk = S._content_tokens(src)
     plan = {"opening": "", "takeaways": [],
-            "scenes": [{"title": "Gating concepts",
+            "scenes": [{"title": "exit codes and schema version gates",
                         "bullets": ["परीक्षण करणे",
                                     "exit codes verdicts"]}]}
     dropped = S._drop_ungrounded_slide_text(plan, bg, tk)
     assert dropped == 1
     assert plan["scenes"][0]["bullets"] == ["exit codes verdicts"]
+    assert plan["scenes"][0]["title"] == "exit codes and schema version gates"
+
+
+def test_ungrounded_title_is_retitled_from_grounded_material():
+    src = ("The 11-step precedence checks structure before comparing values "
+           "and prioritizes FAIL over REVIEW over PASS in the engine.")
+    bg = S._content_ngrams(src)
+    tk = S._content_tokens(src)
+    plan = {"opening": "", "takeaways": [], "scenes": [{
+        "title": "M6 Precedence rules",
+        "topic": "The 11-step precedence checks structure before values",
+        "bullets": ["engine checks structure before comparing values",
+                    "prioritizes FAIL over REVIEW over PASS"],
+    }]}
+    assert S._grounding_issues(plan, bg, tk), "fixture must start ungrounded"
+    S._drop_ungrounded_slide_text(plan, bg, tk)
+    title = plan["scenes"][0]["title"]
+    assert title != "M6 Precedence rules"
+    assert not title.lower().startswith("m6")
+    assert S._grounding_issues(plan, bg, tk) == []
+
+
+def test_grounded_title_is_never_rewritten():
+    src = "Baselines plus compare freeze a known-good snapshot of metrics."
+    bg = S._content_ngrams(src)
+    tk = S._content_tokens(src)
+    plan = {"opening": "", "takeaways": [], "scenes": [{
+        "title": "Baselines plus compare",
+        "topic": "Baselines plus compare",
+        "bullets": ["freeze a known-good snapshot of metrics"],
+    }]}
+    S._drop_ungrounded_slide_text(plan, bg, tk)
+    assert plan["scenes"][0]["title"] == "Baselines plus compare"
 
 
 # ------------------------------------------------- scene-count lever ----

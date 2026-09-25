@@ -22,6 +22,39 @@ def test_trim_narration_word_count_repairs_long_scene() -> None:
     assert not any(item["code"] == "tts_too_long_critical"
                    for item in after["audit"])
 
+def test_speech_expand_splits_unmapped_snake_case_identifiers() -> None:
+    out = S.speech_expand("Save baseline_report.json for the golden set",
+                          S._MHE_VOICE.pronunciation_rules)
+    flat = " ".join(out.split())
+    assert "baseline report dot json" in flat
+    assert "_" not in out
+
+
+def test_audit_has_no_code_fragment_for_unmapped_identifier() -> None:
+    plan = {"scenes": [{
+        "title": "M1 Data and testset",
+        "bullets": ["Freeze a known-good snapshot"],
+        "narration": ("Yeh report ek baseline ke form mein save hota hai, "
+                      "jiska naam baseline_report.json hota hai, aur wahi "
+                      "golden_set_path pointer use karta hai."),
+    }]}
+    script = S.build_tts_script(plan, S._MHE_VOICE)
+    assert not [f for f in script["audit"] if f["code"] == "tts_code_fragment"]
+
+
+def test_audit_word_count_bands_separate_warn_from_critical() -> None:
+    soft = {"role": "scene", "index": 1, "title": "Goldens",
+            "spoken": " ".join(["word"] * 77)}
+    critical = {"role": "scene", "index": 2, "title": "Registry",
+                "spoken": " ".join(["word"] * 91)}
+    soft_codes = {f.code for f in S.audit_tts_script([soft], S._MHE_VOICE)}
+    critical_codes = {f.code for f in
+                      S.audit_tts_script([critical], S._MHE_VOICE)}
+    assert "tts_too_long" in soft_codes
+    assert "tts_too_long_critical" not in soft_codes
+    assert "tts_too_long_critical" in critical_codes
+
+
 def test_speech_expand_longest_first_and_boundary() -> None:
     rules = S._MHE_VOICE.pronunciation_rules
     out = S.speech_expand(

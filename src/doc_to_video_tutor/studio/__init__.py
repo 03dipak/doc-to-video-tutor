@@ -82,6 +82,7 @@ from .plan import (  # noqa: F401
     _concept_headers,
     _contrast_sentences,
     _dedupe_plan_bullets,
+    _drop_repeated_bullet_clauses,
     _drop_ungrounded_slide_text,
     _filter_takeaways_to_retained,
     _fix_placeholder_titles,

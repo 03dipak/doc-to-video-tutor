@@ -50,6 +50,23 @@ from .voice import _make_voice, _voice_fingerprint
 _SAMPLE_SOFT_EXTRA = ("ungrounded slide text",)
 
 
+def narration_under_run_warning(words: int, target_minutes: float) -> str | None:
+    """Warn when the spoken track is materially shorter than the target.
+
+    A lesson that ships at 69% of its requested length reads as truncated, so the
+    warning is a quality signal rather than a structural failure. Returns None
+    when no target is set or the target is met.
+    """
+    if target_minutes <= 0:
+        return None
+    spoken_min = words / LOUDNESS_WPM
+    if spoken_min >= 0.7 * target_minutes:
+        return None
+    return (f"narration under-run: only {spoken_min / target_minutes:.0%} of "
+            f"target reached - MAJOR (A2.6/E1.2); lengthen plan or deepen "
+            f"narration")
+
+
 def _write_tts_artifacts(out_base: Path, script: dict, args) -> None:
     """Apply CLI overrides, persist tts_script.json + script.txt, print the audit."""
     if args.rate:
@@ -76,10 +93,9 @@ def _write_tts_artifacts(out_base: Path, script: dict, args) -> None:
     if target_min:
         print(f"  narration   : {words} words (~{spoken_min:.1f} min spoken) "
               f"vs target {target_min:.1f} min")
-        if spoken_min < 0.7 * target_min:
-            print(f"    [WARN] narration under-run: only "
-                  f"{spoken_min / target_min:.0%} of target reached - "
-                  f"MAJOR (A2.6/E1.2); lengthen plan or deepen narration")
+        under_run = narration_under_run_warning(words, target_min)
+        if under_run:
+            print(f"    [WARN] {under_run}")
     for f in audit:
         print(f"    [{f['severity']}] {f['code']}: {f['message']}")
     print(f"  artifacts   : {out_base}.tts_script.json, "
