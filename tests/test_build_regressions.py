@@ -748,3 +748,76 @@ def test_plan_parse_rejects_a_raw_with_no_complete_object() -> None:
               '"narration": "n", "bullets": ["b"]}\n')
     with pytest.raises(RuntimeError):
         _parse_plan_json(ragged)
+
+
+# --- chrome geometry: overlaps the audit was suppressing -----------------
+#
+# Reported against mod03_gates_v012_009: slides 2,4,5,6,7,9,10. The layout audit
+# had said "no findings" because its overlap tolerance was 0.12in, set earlier to
+# absorb exactly these collisions on the grounds that they read as intentional.
+# They were not intentional - they were defects, and the tolerance was a
+# detector silenced instead of a bug fixed. Two distinct causes:
+#
+#   * the eyebrow box was a round 0.4in tall for 12pt text, so it hung 0.08in
+#     into the title on every content slide (10.00in wide);
+#   * the title box was 11.0in wide from x=0.42, running to 11.42 and under the
+#     page counter at x=11.20 (0.22in).
+#
+# Plus the payload and value cards, which still used a flat 0.3in per line and
+# spilled out under their own card.
+
+def test_no_slide_has_a_non_contained_overlap() -> None:
+    """Geometry check written independently of the studio's own auditor."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    src = Path("output/mod03_gates_v012_009.plan.json")
+    if not src.exists():
+        import pytest
+
+        pytest.skip("plan artifact not present; run the build first")
+    plan = json.loads(src.read_text(encoding="utf-8"))["plan"]
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    build_pptx(plan, out)
+
+    emu = 914400.0
+    offenders: list[str] = []
+    for index, slide in enumerate(Presentation(str(out)).slides, 1):
+        shapes = [s for s in slide.shapes if s.width and s.height]
+        for a in range(len(shapes)):
+            for b in range(a + 1, len(shapes)):
+                A, B = shapes[a], shapes[b]
+                ox = (min(A.left + A.width, B.left + B.width)
+                      - max(A.left, B.left)) / emu
+                oy = (min(A.top + A.height, B.top + B.height)
+                      - max(A.top, B.top)) / emu
+                if ox <= 0.005 or oy <= 0.005:
+                    continue
+                contained = (
+                    (A.left <= B.left and A.top <= B.top
+                     and A.left + A.width >= B.left + B.width
+                     and A.top + A.height >= B.top + B.height)
+                    or (B.left <= A.left and B.top <= A.top
+                        and B.left + B.width >= A.left + A.width
+                        and B.top + B.height >= A.top + A.height))
+                if contained:
+                    continue
+                offenders.append(f"slide {index}: {ox:.2f}x{oy:.2f}in")
+    assert not offenders, offenders
+
+
+def test_chrome_boxes_cannot_collide() -> None:
+    """Eyebrow, title and counter must be geometrically disjoint by construction."""
+    from doc_to_video_tutor.studio.pptx import _est_text_height
+
+    eyebrow_bottom = 0.30 + _est_text_height("HOW DOES IT WORK", 10.0, 12)
+    title_top = 0.62
+    title_right = 0.42 + 10.6
+    counter_left = 11.20
+    assert eyebrow_bottom <= title_top, "eyebrow hangs into the title"
+    assert title_right <= counter_left, "title runs under the page counter"

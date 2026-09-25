@@ -341,12 +341,19 @@ def _ppt_slide_chrome(slide, section: str, title: str, counter: str,
     bar.fill.fore_color.rgb = RGBColor(*ACCENT)
     bar.line.fill.background()
 
-    _ppt_textbox(slide, 0.42, 0.30, 10.0, 0.4, section.upper(), 12,
-                  section_color, bold=True)
+    # Height is the text's own need, not a round 0.4in. At 12pt a line is
+    # ~0.20in plus the textbox's 0.1in of insets, so 0.4in left the eyebrow
+    # hanging 0.08in into the title on every content slide - a real box
+    # overlap that the layout audit's tolerance was suppressing.
+    _ppt_textbox(slide, 0.42, 0.30, 10.0, _est_text_height(section.upper(),
+                                                           10.0, 12),
+                 section.upper(), 12, section_color, bold=True)
     # B1.5: display titles at 32pt (reader-visible hierarchy on 13.3" canvas);
     # capped to a single line so a wrap can't overrun the gold divider at y=1.28.
     # The cap trims on a word boundary, so the frame never shows a half word.
-    _ppt_textbox(slide, 0.42, 0.62, 11.0, 0.62, clip_title(title), 32,
+    # Width stops short of the counter at x=11.20. At 11.0in the title box ran
+    # to 11.42 and overlapped the page number by 0.22in on every content slide.
+    _ppt_textbox(slide, 0.42, 0.62, 10.6, 0.62, clip_title(title), 32,
                  (255, 255, 255), bold=True)
 
     div = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
@@ -563,7 +570,12 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         if scene.get("analogy"):
             body = f"Analogy: {scene['analogy']}"
             need = _est_text_height(body, 12.1, 17)
-            card_h = max(0.72, 0.34 + need + 0.08)
+            # The label is measured too, and the body starts below it. It was a
+            # fixed 0.28in box at y+0.06 with the body at y+0.32, so the two
+            # overlapped by 0.02in on every analogy card.
+            label_h = _est_text_height("ANALOGY", 12.1, 12)
+            body_top = 0.06 + label_h
+            card_h = max(0.72, body_top + need + 0.12)
             if stack.reserve(card_h + 0.2, _RowStack.OPTIONAL, "analogy") is not None:
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
@@ -571,9 +583,9 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 card.fill.solid()
                 card.fill.fore_color.rgb = RGBColor(40, 30, 20)
                 card.line.fill.background()
-                _ppt_textbox(s, 0.62, y + 0.06, 12.1, 0.28,
+                _ppt_textbox(s, 0.62, y + 0.06, 12.1, label_h,
                              "ANALOGY", 12, GOLD, bold=True)
-                _ppt_textbox(s, 0.62, y + 0.32, 12.1, need,
+                _ppt_textbox(s, 0.62, y + body_top, 12.1, need,
                              body, 17, (255, 193, 7), wrap=True)
                 y = stack.y
 
@@ -595,7 +607,13 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         blocks = _video_blocks(scene)
         value_table = (scene.get("value_table") or [])[:4]
         if value_table and "value_table" in blocks:
-            table_h = 0.45 + 0.3 * len(value_table)
+            # Row height comes from the taller of the two cells, not a flat
+            # 0.3in. A long right-hand cell used to spill out under the card.
+            row_heights = [
+                max(_est_text_height(str(row).partition("|")[0], 6.2, 17),
+                    _est_text_height(str(row).partition("|")[2], 5.9, 17))
+                for row in value_table]
+            table_h = 0.45 + sum(row_heights)
             if stack.reserve(table_h, _RowStack.SUPPORTING, "numbers") is not None:
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
                                           Inches(0.52), Inches(y),
@@ -605,20 +623,23 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 card.line.fill.background()
                 _ppt_textbox(s, 0.62, y + 0.05, 12.1, 0.26,
                              "NUMBERS", 12, GOLD, bold=True)
+                row_y = y + 0.42
                 for j, row in enumerate(value_table):
                     cell_left, _, cell_right = str(row).partition("|")
-                    row_y = y + 0.42 + j * 0.3
-                    _ppt_textbox(s, 0.62, row_y, 6.2, 0.28, cell_left.strip(),
-                                 17, (235, 238, 245))
-                    _ppt_textbox(s, 6.9, row_y, 5.9, 0.28, cell_right.strip(),
-                                 17, (140, 200, 255))
+                    _ppt_textbox(s, 0.62, row_y, 6.2, row_heights[j],
+                                 cell_left.strip(), 17, (235, 238, 245))
+                    _ppt_textbox(s, 6.9, row_y, 5.9, row_heights[j],
+                                 cell_right.strip(), 17, (140, 200, 255))
+                    row_y += row_heights[j]
                 y = stack.y
 
         # 1-based for humans; the loop index is 0-based.
         slide_notes.extend(f"slide {i + 1}: {n}" for n in stack.report())
         if "json" in blocks:
             for json_lines in _json_payload_candidates(scene):
-                json_h = 0.34 + len(json_lines) * 0.3
+                line_heights = [_est_text_height(ln, 12.1, 16)
+                                for ln in json_lines]
+                json_h = 0.34 + sum(line_heights)
                 if stack.reserve(json_h, _RowStack.OPTIONAL, "payload") is None:
                     continue
                 card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
@@ -629,10 +650,12 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 card.line.fill.background()
                 _ppt_textbox(s, 0.62, y + 0.04, 12.1, 0.24,
                              "PAYLOAD", 12, GOLD, bold=True)
+                line_y = y + 0.34
                 for j, ln in enumerate(json_lines):
-                    _ppt_textbox(s, 0.62, y + 0.34 + j * 0.3, 12.1, 0.28,
+                    _ppt_textbox(s, 0.62, line_y, 12.1, line_heights[j],
                                  ln, 16, (180, 220, 255),
                                  font_name="Courier New")
+                    line_y += line_heights[j]
                 break
 
     if takes:
@@ -705,7 +728,11 @@ def build_pptx(plan: dict, out_path: Path) -> None:
 # Text taller than its box is not clipped by PowerPoint, it is drawn over
 # whatever follows. `_AUDIT_OVERLAP_TOL` absorbs the sub-0.1in eyebrow/title
 # collisions that are present in every slide by design and read as intentional.
-_AUDIT_OVERLAP_TOL = 0.12
+# Deliberately tiny. This was 0.12in, set to absorb the eyebrow/title collision
+# that turned out to be a real defect on every content slide - a tolerance
+# chosen to silence a detector instead of fixing what it found. Any positive
+# overlap of two non-contained boxes is now reported.
+_AUDIT_OVERLAP_TOL = 0.01
 # A PowerPoint textbox carries ~0.05 in of top and bottom inset, so a single
 # short line in a snug box "overflows" by up to 0.1 in and nothing is visible.
 # Only spills large enough to cross a card or a neighbouring element are worth a
