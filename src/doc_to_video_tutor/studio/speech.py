@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .text import _nar_tokens
 from .voice import NarrationVoice, PronunciationRule
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?\u0964\u0965])\s+")
@@ -81,6 +82,31 @@ def _known_terms(plan: dict, voice: NarrationVoice) -> frozenset[str]:
                 if len(wl) >= 3:
                     known.add(wl)
     return frozenset(known)
+
+
+_NUMBER_WORD_DIGITS = {word: str(i) for i, word in enumerate(_NUM_WORDS)}
+
+
+def spoken_token_set(text: str, rules: tuple | None = None) -> frozenset[str]:
+    """Tokens of ``text`` in the form a comparison against spoken text needs.
+
+    A PowerPoint badge says ``3`` while the narrator says "exit three", so a
+    naive token comparison reports a fact as unspoken when it is being spoken.
+    That is the same asymmetry the reveal matcher had to solve, and it is solved
+    the same way: put both sides in one alphabet before comparing, by folding
+    number-words back to digits and applying the profile's spoken-form
+    expansion. Applied here it stops the unspoken-claim gate from crying wolf on
+    every numeric badge in the deck.
+    """
+    body = str(text)
+    if rules:
+        body = speech_expand(body, rules)
+    # IGNORECASE means the match can be "Zero", so the lookup has to fold case
+    # too - a sentence-initial "Zero means pass" would otherwise raise KeyError.
+    folded = re.sub(r"\b(" + "|".join(_NUMBER_WORD_DIGITS) + r")\b",
+                    lambda m: _NUMBER_WORD_DIGITS[m.group(1).lower()], body,
+                    flags=re.IGNORECASE)
+    return frozenset(_nar_tokens(folded))
 
 
 def contains_suspicious_script_mix(text: str) -> bool:

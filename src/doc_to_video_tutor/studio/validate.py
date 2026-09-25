@@ -20,7 +20,7 @@ from .plan import (
     _scene_count_problem,
     _section_problems,
 )
-from .speech import contains_corrupt_text
+from .speech import contains_corrupt_text, spoken_token_set
 from .text import (
     _has_non_latin_script,
     _merged_token_issues,
@@ -210,6 +210,69 @@ def check_audit_binding(plan_path: Path, audit_path: Path) -> list[str]:
     return findings
 
 
+def _unspoken_visual_claims(plan: dict,
+                           voice: NarrationVoice | None = None) -> list[str]:
+    """Structured visual facts the scene shows but the narration never names.
+
+    Only structured blocks are checked - status badges and JSON payload keys -
+    because those are mechanically decidable. A judgement call like "is this
+    decorative element earning its place" is deliberately not automated: it has
+    no decidable form, and a gate that cannot be computed reliably produces
+    false positives that train everyone to ignore the gate.
+
+    This exists because the enrichment that puts a five-value exit-code legend on
+    screen also created the risk that four of those values are never spoken. On
+    `mod03_gates_v012_002` the badge row showed `0 PASS` through `4 CONFIG ERR`
+    while the narration mentioned only 3 and 4, so the viewer reads three facts
+    the lesson never explains. Soft, not hard: the remedy is a narration or
+    enrichment decision, and silently rewriting the script to enumerate a legend
+    is exactly the kind of content injection the narration contract forbids.
+    """
+    findings: list[str] = []
+    rules = tuple(voice.pronunciation_rules) if voice is not None else None
+    for index, scene in enumerate(plan.get("scenes", []), 1):
+        if not str(scene.get("narration", "")).strip():
+            continue
+        # Compare in the spoken alphabet: the badge says "3" and the narrator
+        # says "exit three", so a raw substring test reports a spoken fact as
+        # unspoken. See `spoken_token_set`.
+        spoken = spoken_token_set(str(scene["narration"]), rules)
+        unspoken: list[str] = []
+        for badge in (scene.get("status_badges") or []):
+            if not isinstance(badge, dict):
+                continue
+            code = str(badge.get("code", "")).strip()
+            label = str(badge.get("label", "")).strip()
+            code_hit = bool(spoken_token_set(code, rules) & spoken)
+            label_hit = bool(spoken_token_set(label, rules) & spoken)
+            if not code_hit and not label_hit:
+                unspoken.append(f"{code} {label}".strip())
+        snippet = scene.get("json_snippet")
+        if isinstance(snippet, str) and snippet.strip():
+            for key in _json_keys(snippet):
+                if not (spoken_token_set(key, rules) & spoken):
+                    unspoken.append(key)
+        if unspoken:
+            findings.append(
+                f"scene {index} unspoken visual claim: the slide shows "
+                f"{', '.join(unspoken[:6])} but the narration never mentions "
+                f"them; the viewer reads facts the lesson does not explain")
+    return findings
+
+
+def _json_keys(snippet: str) -> list[str]:
+    """Top-level-ish object keys in a JSON payload, without a parse requirement.
+
+    The snippet arrives as rendered text, not a parsed object, and it is allowed
+    to be a fragment. A regex over quoted keys is enough for a coverage check and
+    cannot fail on input a real parse would reject.
+    """
+    import re as _re
+
+    return [m.group(1) for m in _re.finditer(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:',
+                                            snippet)][:6]
+
+
 def _render_blocking_problems(plan: dict,
                               voice: NarrationVoice | None = None,
                               protected: frozenset[str] | None = None
@@ -265,6 +328,7 @@ def guard_plan(plan: dict, topics: list[str],
     problems += _narration_integrity_problems(plan)
     problems += _scene_metadata_problems(plan)
     problems += _slide_text_language_problems(plan)
+    problems += _unspoken_visual_claims(plan, voice)
     if _opening_template_hit(plan):
         problems.append("opening reuses prompt example sentence")
     if source_top:

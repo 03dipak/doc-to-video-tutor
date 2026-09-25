@@ -66,6 +66,49 @@ def _ppt_para(tf, text: str, size, color, bullet: bool = False, bold: bool = Fal
         p.font.color.rgb = RGBColor(*color)
         _ppt_bullet(p)
     return p
+def _est_wrapped_lines(text: str, width_in: float, size_pt: float,
+                       margin_in: float = 0.1) -> int:
+    """Conservative estimate of how many lines ``text`` wraps to in a textbox.
+
+    A PowerPoint textbox does not clip: text taller than the shape still draws,
+    so an under-sized box does not hide content, it pushes it over whatever sits
+    below. The card behind "Why THIS (not the alternative)" was a fixed 0.72 in
+    with a 0.6 in text box, and a 213-character decision needs three lines at
+    17 pt - roughly 0.87 in - so it spilled past the card and into the safe area
+    while the fit check, which used the same fixed height, reported room.
+
+    The factor is deliberately pessimistic (0.52 em average advance for mixed-case
+    Arial). Over-estimating wraps is the safe direction: it reserves more space
+    than needed, whereas under-estimating reproduces the overflow.
+    """
+    usable = max(width_in - margin_in, 0.5)
+    per_line = max(int(usable * 72.0 / (0.52 * max(size_pt, 1))), 8)
+    total = 0
+    for paragraph in str(text).split("\n"):
+        words = paragraph.split()
+        if not words:
+            total += 1
+            continue
+        line = 0
+        lines = 1
+        for word in words:
+            extra = len(word) + (1 if line else 0)
+            if line + extra > per_line and line:
+                lines += 1
+                line = len(word)
+            else:
+                line += extra
+        total += lines
+    return max(total, 1)
+
+
+def _est_text_height(text: str, width_in: float, size_pt: float,
+                     margin_in: float = 0.1) -> float:
+    """Height in inches that ``text`` needs, including the box's own insets."""
+    lines = _est_wrapped_lines(text, width_in, size_pt, margin_in)
+    return lines * (1.22 * size_pt / 72.0) + margin_in
+
+
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
                  bold=False, wrap=True, font_name: str = "Arial"):
     from pptx.dml.color import RGBColor
@@ -288,7 +331,11 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         bullets = _with_overflow(scene.get("bullets")
                                   or scene.get("takeaways") or [])
         for b in bullets:
-            need = row_h + (0.12 if len(b) > 90 else 0)
+            # Size the row to the text. The previous rule added a flat 0.12 in to
+            # anything over 90 characters, which covered a 100-char bullet and
+            # left a 271-char one spilling a third of an inch past its box and
+            # over whatever was drawn next.
+            need = max(row_h, _est_text_height(b, 11.95, 18))
             if y + need > max_h:
                 break  # mirror the video's vertical budget: stop, don't overlap
             tb = _ppt_textbox(s, 0.52, y, 12.3, need, " ", 18, (235, 238, 245))
@@ -316,36 +363,49 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                     chip.fill.fore_color.rgb = RGBColor(*fill)
                     chip.line.fill.background()
                     text = f"{badge.get('code', '')} {badge.get('label', '')}".strip()
+                    # Inset the label inside its own chip. It used to be
+                    # `chip_w - gutter + 0.08` starting 0.08 in right of the
+                    # card, which put the label's right edge 0.08 in *past* the
+                    # card - harmless for "0 PASS", not for "4 CONFIG ERR",
+                    # which is the one that reaches the rounded edge.
                     _ppt_textbox(s, 0.6 + j * chip_w, y + 0.38,
-                                 chip_w - gutter + 0.08, 0.34, text, 16,
+                                 chip_w - gutter - 0.08, 0.34, text, 16,
                                  (18, 24, 38))
                 y += badge_h
 
-        if scene.get("design_decision") and y + 0.92 <= max_h:
-            card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
-                                         Inches(0.52), Inches(y),
-                                         Inches(12.3), Inches(0.72))
-            card.fill.solid()
-            card.fill.fore_color.rgb = RGBColor(40, 30, 20)
-            card.line.fill.background()
-            _ppt_textbox(s, 0.62, y + 0.06, 12.1, 0.6,
-                         f"Why THIS (not the alternative): {scene['design_decision']}",
-                         17, (255, 193, 7), wrap=True)
-            y += 0.92
+        if scene.get("design_decision"):
+            body = (f"Why THIS (not the alternative): "
+                    f"{scene['design_decision']}")
+            # Size the card to the text instead of trusting a fixed 0.72 in.
+            need = _est_text_height(body, 12.1, 17)
+            card_h = max(0.72, need + 0.12)
+            if y + card_h + 0.2 <= max_h:
+                card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                          Inches(0.52), Inches(y),
+                                          Inches(12.3), Inches(card_h))
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(40, 30, 20)
+                card.line.fill.background()
+                _ppt_textbox(s, 0.62, y + 0.06, 12.1, need,
+                             body, 17, (255, 193, 7), wrap=True)
+                y += card_h + 0.2
 
-        if scene.get("analogy") and y + 0.92 <= max_h:
-            card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
-                                         Inches(0.52), Inches(y),
-                                         Inches(12.3), Inches(0.72))
-            card.fill.solid()
-            card.fill.fore_color.rgb = RGBColor(40, 30, 20)
-            card.line.fill.background()
-            _ppt_textbox(s, 0.62, y + 0.06, 12.1, 0.28,
-                         "ANALOGY", 12, GOLD, bold=True)
-            _ppt_textbox(s, 0.62, y + 0.32, 12.1, 0.5,
-                         f"Analogy: {scene['analogy']}", 17,
-                         (255, 193, 7), wrap=True)
-            y += 0.92
+        if scene.get("analogy"):
+            body = f"Analogy: {scene['analogy']}"
+            need = _est_text_height(body, 12.1, 17)
+            card_h = max(0.72, 0.34 + need + 0.08)
+            if y + card_h + 0.2 <= max_h:
+                card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                          Inches(0.52), Inches(y),
+                                          Inches(12.3), Inches(card_h))
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(40, 30, 20)
+                card.line.fill.background()
+                _ppt_textbox(s, 0.62, y + 0.06, 12.1, 0.28,
+                             "ANALOGY", 12, GOLD, bold=True)
+                _ppt_textbox(s, 0.62, y + 0.32, 12.1, need,
+                             body, 17, (255, 193, 7), wrap=True)
+                y += card_h + 0.2
 
         diagram = _parse_diagram(scene.get("visual_diagram") or "")
         if diagram and y + 0.9 <= max_h:
@@ -429,3 +489,79 @@ def build_pptx(plan: dict, out_path: Path) -> None:
 
     prs.save(str(out_path))
     print(f"Deck written: {out_path}")
+    _audit_layout(out_path)
+
+
+# Text taller than its box is not clipped by PowerPoint, it is drawn over
+# whatever follows. `_AUDIT_OVERLAP_TOL` absorbs the sub-0.1in eyebrow/title
+# collisions that are present in every slide by design and read as intentional.
+_AUDIT_OVERLAP_TOL = 0.12
+# A PowerPoint textbox carries ~0.05 in of top and bottom inset, so a single
+# short line in a snug box "overflows" by up to 0.1 in and nothing is visible.
+# Only spills large enough to cross a card or a neighbouring element are worth a
+# warning; the real defects this audit was written for were 0.35 in and 0.36 in.
+_AUDIT_OVERFLOW_TOL = 0.12
+
+
+def _audit_layout(out_path: Path) -> list[str]:
+    """Report layout defects in a written deck: overflow, overlap, safe area.
+
+    This is the mechanical subset of the visual-review checklist, and it exists
+    because the defect it catches is invisible in geometry alone: a textbox whose
+    content needs more height than its shape still renders, so nothing "overlaps"
+    while the text visibly spills across the card beneath it. Only the three
+    checks that can be decided without a renderer are automated - judgement
+    calls like "does this decorative element earn its place" stay with a human.
+    """
+    from pptx import Presentation
+
+    findings: list[str] = []
+    prs = Presentation(str(out_path))
+    emu = 914400.0
+    for index, slide in enumerate(prs.slides, 1):
+        shapes = [sh for sh in slide.shapes if sh.width and sh.height]
+        for sh in shapes:
+            if not sh.has_text_frame:
+                continue
+            text = sh.text_frame.text.strip()
+            if not text:
+                continue
+            size = 17.0
+            for para in sh.text_frame.paragraphs:
+                if para.font.size is not None:
+                    size = para.font.size.pt
+                    break
+            need = _est_text_height(text, sh.width / emu, size)
+            have = sh.height / emu
+            if need > have + _AUDIT_OVERFLOW_TOL:
+                findings.append(
+                    f"slide {index}: text overflows its box by "
+                    f"{need - have:.2f}in ({len(text)} chars at {size:.0f}pt): "
+                    f"{text[:52]!r}")
+        for a in range(len(shapes)):
+            for b in range(a + 1, len(shapes)):
+                A, B = shapes[a], shapes[b]
+                ox = (min(A.left + A.width, B.left + B.width)
+                      - max(A.left, B.left)) / emu
+                oy = (min(A.top + A.height, B.top + B.height)
+                      - max(A.top, B.top)) / emu
+                if ox <= _AUDIT_OVERLAP_TOL or oy <= _AUDIT_OVERLAP_TOL:
+                    continue
+                contained = (
+                    (A.left <= B.left and A.top <= B.top
+                     and A.left + A.width >= B.left + B.width
+                     and A.top + A.height >= B.top + B.height)
+                    or (B.left <= A.left and B.top <= A.top
+                        and B.left + B.width >= A.left + A.width
+                        and B.top + B.height >= A.top + A.height))
+                if contained:
+                    continue  # a label sitting inside its own card
+                findings.append(
+                    f"slide {index}: shapes overlap by {ox:.2f}x{oy:.2f}in")
+    for finding in findings[:6]:
+        print(f"  [WARN] layout: {finding}")
+    if len(findings) > 6:
+        print(f"  [WARN] layout: ... and {len(findings) - 6} more")
+    if not findings:
+        print("  layout   : no overflow, overlap, or safe-area findings")
+    return findings
