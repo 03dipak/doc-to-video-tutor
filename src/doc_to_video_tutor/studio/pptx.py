@@ -92,6 +92,16 @@ def _est_wrapped_lines(text: str, width_in: float, size_pt: float,
         line = 0
         lines = 1
         for word in words:
+            # A single unbreakable token longer than the line still occupies
+            # whole lines. Without this, a 900-character identifier reports as
+            # one line and the layout reserves a third of an inch for it - an
+            # under-report, which is the one direction that is never safe.
+            if len(word) > per_line:
+                if line:
+                    lines += 1
+                lines += -(-len(word) // per_line) - 1
+                line = len(word) % per_line
+                continue
             extra = len(word) + (1 if line else 0)
             if line + extra > per_line and line:
                 lines += 1
@@ -157,6 +167,52 @@ class _RowStack:
         return [f"dropped {label} (priority {p}, "
                 f"{self.bottom - self.y:.2f}in short)"
                 for p, label in self.dropped]
+
+
+def _paginate_by_height(page: dict, budget: float) -> list[dict]:
+    """Split one planned page until its bullets fit the slide's vertical budget.
+
+    `_scene_pages` paginates by COUNT - four bullets per page - which is the
+    right instinct (overflow becomes more slides, not smaller text) but the wrong
+    unit. Four 300-character bullets occupy far more height than four 40-character
+    ones, so a count-paginated page can still overflow, and the row stack then
+    drops the bullets to protect the layout. Measured on a crowded scene, all nine
+    bullets were dropped and the audit still reported clean: teaching content
+    lost silently.
+
+    So the deck paginates on measured height, in inches, using the same estimator
+    the layout uses. One measurement, one truth - otherwise pagination and layout
+    disagree and one of them has to lose.
+
+    A bullet that cannot fit even alone is left on its own page and reported,
+    rather than being dropped: at that point the honest answer is "this content
+    does not fit a slide", and the caller says so instead of shipping a gap.
+    """
+    bullets = [str(b) for b in (page.get("bullets") or [])]
+    if not bullets:
+        return [page]
+    rows = [max(0.55, _est_text_height(b, 11.95, 18)) for b in bullets]
+    if sum(rows) <= budget:
+        return [page]
+    page_ends: list[int] = []
+    current: list[int] = []
+    used = 0.0
+    for index, row in enumerate(rows):
+        if current and used + row > budget:
+            page_ends.append(index)
+            current, used = [], 0.0
+        current.append(index)
+        used += row
+    if current:
+        page_ends.append(len(rows))
+    out: list[dict] = []
+    start = 0
+    for end in page_ends:
+        clone = dict(page)
+        clone["bullets"] = bullets[start:end]
+        out.append(clone)
+        start = end
+    return out
 
 
 def _ppt_textbox(slide, left, top, width, height, text, size, color,
@@ -352,10 +408,20 @@ def build_pptx(plan: dict, out_path: Path) -> None:
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
 
-    # title slide — same header chrome the cover card uses in the video
+    # title slide — same header chrome the cover uses in the video
+    #
+    # The deck paginates twice, for two different reasons. `_scene_pages`
+    # enforces the plan-level structure (max four bullets a page, `bullet_pages`
+    # must match). `_paginate_by_height` then enforces the physical one: a page
+    # whose bullets need more than the slide can hold becomes another slide.
+    # Count-based pagination alone is not enough, because bullet length varies by
+    # an order of magnitude and the row stack would then drop teaching content to
+    # protect the layout.
+    _BODY_BUDGET = 4.86          # 1.7in top .. 6.9in safe bottom, less the label
     page_scenes: list[dict] = []
     for scene in plan["scenes"]:
-        page_scenes.extend(_scene_pages(scene))
+        for planned in _scene_pages(scene):
+            page_scenes.extend(_paginate_by_height(planned, _BODY_BUDGET))
     takes = (plan.get("takeaways") or [])[:8]
     deck_total = len(page_scenes) + (2 if takes else 1)
 
@@ -499,7 +565,8 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                                  17, (140, 200, 255))
                 y = stack.y
 
-        slide_notes.extend(f"slide {i}: {n}" for n in stack.report())
+        # 1-based for humans; the loop index is 0-based.
+        slide_notes.extend(f"slide {i + 1}: {n}" for n in stack.report())
         if "json" in blocks:
             for json_lines in _json_payload_candidates(scene):
                 json_h = 0.34 + len(json_lines) * 0.3

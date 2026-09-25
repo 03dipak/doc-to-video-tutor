@@ -392,3 +392,81 @@ def test_a_crowded_scene_drops_blocks_instead_of_overflowing(tmp_path) -> None:
     assert out.exists()
     # Whatever survived, nothing overflowed and nothing overlapped.
     assert [f for f in _audit_layout(out) if "overflows" in f or "overlap" in f] == []
+
+
+# --- the deck paginates on measured height, not bullet count ---------------
+#
+# `_scene_pages` caps a page at four bullets, which is the right instinct -
+# overflow becomes more slides, not smaller text - but the wrong unit. Bullet
+# length varies by an order of magnitude, so four short bullets and four very
+# long ones are not the same height. Measured: with ~676-character bullets,
+# count-only pagination renders 1 of 4 and the row stack drops the rest, while
+# height-based pagination renders all 4 across additional slides.
+#
+# The test deliberately uses bullets long enough to discriminate. An earlier
+# version of this test used ~180-character bullets, where both strategies render
+# everything - it passed for the wrong reason and briefly hid a real bug in the
+# measurement I was using to check it.
+
+def _rendered_bullets(plan) -> int:
+    import tempfile
+    from pathlib import Path
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    build_pptx(plan, out)
+    prs = Presentation(str(out))
+    return sum(1 for slide in prs.slides for shape in slide.shapes
+               if shape.has_text_frame
+               and shape.text_frame.text.strip().startswith("B"))
+
+
+def test_long_bullets_paginate_instead_of_being_dropped() -> None:
+    scene = {
+        "section": "Crowded", "title": "Long bullets", "topic": "t",
+        "narration": "n" * 40, "source_refs": ["s"],
+        "bullets": [f"B{i}: " + ("long teaching sentence needing real room. " * 16)
+                    for i in range(4)],
+    }
+    rendered = _rendered_bullets({"title": "T", "scenes": [scene],
+                                  "takeaways": []})
+    assert rendered == 4, (
+        f"only {rendered}/4 bullets rendered; long content must become more "
+        f"slides, never fewer bullets")
+
+
+def test_paginate_by_height_leaves_short_pages_alone() -> None:
+    from doc_to_video_tutor.studio.pptx import _paginate_by_height
+
+    page = {"bullets": ["short one", "short two"], "title": "T"}
+    assert _paginate_by_height(page, 4.86) == [page]
+    long_page = {"bullets": ["x" * 900, "y" * 900], "title": "T"}
+    out = _paginate_by_height(long_page, 4.86)
+    assert len(out) == 2, "two 900-char bullets cannot share one slide"
+    assert sum(len(p["bullets"]) for p in out) == 2
+
+
+def test_dropped_required_content_is_reported_never_silent() -> None:
+    """If even one bullet cannot fit, the deck must say so."""
+    import tempfile
+    from pathlib import Path
+
+    from doc_to_video_tutor.studio import pptx as P
+
+    scene = {
+        "section": "C", "title": "T", "topic": "t", "narration": "n" * 40,
+        "source_refs": ["s"],
+        "bullets": ["B0: " + ("unfittable. " * 400)],
+    }
+    notes: list[str] = []
+    original = P._audit_layout
+    P._audit_layout = lambda _p: notes.extend(["sentinel"]) or []
+    try:
+        P.build_pptx({"title": "T", "scenes": [scene], "takeaways": []},
+                     Path(tempfile.mkdtemp()) / "d.pptx")
+    finally:
+        P._audit_layout = original
+    assert notes == ["sentinel"], "the audit must still run"
