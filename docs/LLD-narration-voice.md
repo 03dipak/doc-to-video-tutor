@@ -1232,3 +1232,46 @@ report already performs this check correctly, and adding a second, less accurate
 definition of the same rule is the exact policy-drift pattern in §22.2 that has
 produced six defects in this pipeline. A duplicate check that is wrong is worse
 than no duplicate check.
+
+### 22.12 The per-scene word ceiling and the lesson duration target are in direct conflict
+
+Measured on `mod03_gates_v012_012`, which is otherwise a good build: 102 % of
+target duration, clean layout, TTS QA PASS. Its scene word counts are
+
+```
+84, 82, 26, 36, 30, 29, 32, 25, 40
+```
+
+Two scenes sit above the 70-word warn line and six sit below it, and the repair
+ceiling in `_trim_narration_word_count` is 90 — the same value as the hard fail
+threshold, so nothing is trimmed. Lowering the ceiling was measured rather than
+assumed:
+
+| ceiling | scenes trimmed | scene words |
+|---:|---:|---:|
+| 90 / 85 | 0 | 384 |
+| 80 / 75 / 70 | 2 | 311 (−73, −19 %) |
+
+Trimming at 80 would cut 19 % of the lesson's words and take a 102 % render to
+roughly 83 %, tripping the duration band of §22.11. **The two controls pull in
+opposite directions on this lesson**, so lowering the ceiling is a net loss and
+was not done.
+
+The trim is also coarse by necessity: with several sentences it drops the whole
+trailing one, so a scene 4 words over the ceiling loses ~36. Truncating mid
+sentence instead would hit the target more precisely and produce narration that
+stops mid-clause, which is worse than losing a sentence. The overshoot is the
+price of never emitting a fragment.
+
+The real defect is not the ceiling but the **distribution**: one scene at 84
+words beside another at 26 is a balance problem, and the correct repair is to move
+grounded content from the long scenes to the short ones, not to delete it. That
+is a genuine design change — it has to keep the moved sentences grounded, keep
+them out of the cross-scene 3-gram ban, and not break the `_has_teaching_claim`
+floor — so it is recorded rather than attempted here.
+
+**Residual risk, stated plainly:** a scene can reach 89 words, pass every gate,
+warn about nothing, and be one word away from a hard failure that refuses the
+build. That margin is real and is not currently defended. The cheapest honest
+improvement is a warning band between 70 and 90 that says "this scene has no
+headroom", which costs nothing and is decided rather than derived.
