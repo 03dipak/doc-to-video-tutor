@@ -15,15 +15,21 @@ uv sync
 
 ## Usage
 
+`doc-to-studio` is the pipeline. `doc-to-video-tutor` is **deprecated** - see
+[Deprecation](#deprecation) below.
+
 ```bash
-# audio lesson (default) from a design doc, explained in Hindi
-uv run doc-to-video-tutor doc/design/03_lld_tests.md
+# video lesson (slides + narration) - the default output
+uv run doc-to-studio build doc/design/03_lld_tests.md
 
-# video lesson (slides + narration)
-uv run doc-to-video-tutor doc/design/03_lld_tests.md -v
+# audio only
+uv run doc-to-studio build doc/design/03_lld_tests.md --skip-video
 
-# Marathi audio from a PPT deck
-uv run doc-to-video-tutor slides.pptx --lang mr
+# English narration rather than the MHE mix
+uv run doc-to-studio build slides.pptx --narr-voice english
+
+# Marathi/Hindi narration is the default profile
+uv run doc-to-studio build slides.pptx --narr-voice mhe-mix
 
 # STUDIO: high-quality synced video + PPTX deck from several docs.
 # (`uv run doc-to-studio ...` is an alias for the same command.)
@@ -121,3 +127,27 @@ Note: multiple input files are accepted (they are merged into one lesson).
 - An OpenAI-compatible LLM endpoint (`LLM_BASE_URL`) — e.g. Qwen 7B local, Ollama
 - 8GB+ VRAM for Qwen 7B; use `qwen2.5:3b` for CPU-only
 - Network access to Microsoft Edge TTS servers for `edge-tts`
+## Deprecation
+
+`doc-to-video-tutor` is the legacy path and is being retired. It still works, and
+it now **hands off to `doc-to-studio`**, so existing scripts and shell aliases
+keep running - but it prints a deprecation banner and will be removed in one
+release.
+
+It is being retired because it contains **no quality gates**: no grounding
+check, no narration contract, no repeat enforcement, no layout audit. The design
+contract states that damaged narration can never reach TTS or video, and this
+command bypassed every check that enforces it.
+
+The old flags are translated, so nothing is silently dropped:
+
+| deprecated | replacement |
+|---|---|
+| `doc.md` (positional) | unchanged |
+| `-a` / `--audio` | `build --skip-video` |
+| `-v` / `--video` | accepted and ignored - video is the default now |
+| `--lang hi` / `mr` | `--narr-voice mhe-mix` |
+| `--lang en` | `--narr-voice english` |
+| `--voice`, `--minutes`, `--out` | unchanged |
+
+Anything the shim cannot translate raises rather than being ignored.

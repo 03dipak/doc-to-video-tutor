@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import os
 import re
+import sys
 from pathlib import Path
 
 import requests
@@ -245,36 +246,79 @@ def create_video(text: str, audio_path: Path, out_path: Path) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+# `doc-to-video-tutor` is DEPRECATED. It is kept for one release cycle as a
+# translating shim, then removed. It is not repointed silently, and it is not
+# deleted outright: someone's shell alias or CI script calls this name today.
+#
+# Why it had to change: this path contains NO quality machinery - no grounding
+# gate, no narration contract, no repeat enforcement, no layout audit. The LLD
+# invariant is that damaged narration can never reach TTS or video, and a
+# documented live command that bypasses every gate contradicts it. The README
+# documented this command, so the gap was reachable by following the docs.
+#
+# `--lang` never existed on `studio`; it maps exactly onto `--narr-voice`
+# (`hi`/`mr` -> `mhe-mix`, `en` -> `english`), so the shim translates it and
+# names the replacement. Anything it cannot translate raises rather than being
+# ignored.
+_LANG_TO_VOICE = {"hi": "mhe-mix", "mr": "mhe-mix", "en": "english"}
+
+
 def main() -> None:
+    """Deprecated entry point. Translates to `doc-to-studio` and delegates."""
     parser = argparse.ArgumentParser(
-        description="Design docs / PPT / transcripts -> beginner audio or video lesson."
+        prog="doc-to-video-tutor",
+        description="DEPRECATED - use `doc-to-studio build`. This command is a "
+                    "translating shim and will be removed in one release.",
+        epilog="Replacement: doc-to-studio build <inputs> [--minutes N] "
+               "[--out BASE] [--voice V] [--narr-voice mhe-mix|english] "
+               "[--skip-video]",
     )
     parser.add_argument("inputs", nargs="+", help="path(s) to .md, .txt, or .pptx")
     parser.add_argument(
-        "-a", "--audio", action="store_true", help="output audio mp3 (default)"
-    )
-    parser.add_argument("-v", "--video", action="store_true", help="output video mp4")
-    parser.add_argument("--lang", default="hi", choices=("hi", "mr", "en"))
+        "-a", "--audio", action="store_true", help="output audio only (default)")
+    parser.add_argument(
+        "-v", "--video", action="store_true",
+        help="DEPRECATED and ignored: studio always renders video unless "
+             "--skip-video is passed")
+    parser.add_argument("--lang", default=None, choices=("hi", "mr", "en"),
+                        help="mapped to --narr-voice")
     parser.add_argument("--voice", default=None, help="override TTS voice")
-    parser.add_argument("--minutes", type=float, default=3.0,
-                        help="target spoken length (default 3.0 min)")
-    parser.add_argument("--out", default=None, help="output file path")
+    parser.add_argument("--minutes", type=float, default=None,
+                        help="target spoken length (studio default 3.0 min)")
+    parser.add_argument("--out", default=None, help="output base path")
     args = parser.parse_args()
 
-    content = load_content(args.inputs)
-    lesson = generate_lesson(content, args.lang, args.minutes)
-
-    base = Path(args.out) if args.out else Path(args.inputs[0]).stem
-
     if args.video:
-        audio_path = Path(f"{base}.mp3")
-        text_to_audio(lesson, audio_path, args.voice)
-        create_video(lesson, audio_path, Path(f"{base}.mp4"))
-    else:
-        out_path = Path(f"{base}.mp3")
-        text_to_audio(lesson, out_path, args.voice)
-        print(f"Audio written: {out_path}")
+        print("  NOTE: -v/--video is now the default; the flag is accepted and "
+              "ignored rather than rejected, so existing invocations still run.",
+              file=sys.stderr)
 
+    argv: list[str] = ["build", *args.inputs]
+    if args.minutes is not None:
+        argv += ["--minutes", str(args.minutes)]
+    if args.out is not None:
+        argv += ["--out", args.out]
+    if args.voice:
+        argv += ["--voice", args.voice]
+    if args.lang:
+        argv += ["--narr-voice", _LANG_TO_VOICE[args.lang]]
+    if args.audio:
+        argv += ["--skip-video"]
 
-if __name__ == "__main__":
-    main()
+    print("=" * 72, file=sys.stderr)
+    print("  DEPRECATED: `doc-to-video-tutor` is the legacy, UNGATED pipeline.",
+          file=sys.stderr)
+    print("  It has no grounding gate, narration contract or layout audit. It is",
+          file=sys.stderr)
+    print("  being retired; this invocation is being handed to `doc-to-studio`.",
+          file=sys.stderr)
+    if args.lang:
+        print(f"  --lang {args.lang} -> --narr-voice "
+              f"{_LANG_TO_VOICE[args.lang]}", file=sys.stderr)
+    print("  Update the call site: doc-to-studio "
+          + " ".join(("-a/--audio was dropped" if False else "") or argv[1:]),
+          file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+
+    from .studio.cli import main as studio_main
+    studio_main(argv)

@@ -2083,3 +2083,148 @@ A new section, because untested code is a real finding rather than a nit:
 Available to it because §AG narrowed the interpreter problem: it can now run
 `uv run python -m pytest --cov=...` without a permission prompt, while still
 being unable to run the suite for any other reason.
+
+## AJ. External review of the two open decisions — both upheld, one revised
+
+The review of §AB and §AA was checked against the code before being accepted.
+Two of its claims held, one was refuted, and the requested root-cause trace
+produced a definite answer.
+
+### AJ1. §AB APPROVED — and the precondition found a real gap
+
+**Accepted as a safety gap, not a design preference.** A documented, live CLI
+that bypasses `guard_plan` and `_render_blocking_problems` contradicts the LLD's
+own invariant that damaged narration can never reach TTS or video. Anyone
+following the README can ship an ungated build.
+
+**The precondition was worth running.** `--lang` exists on the legacy CLI and
+**has no equivalent** on `studio`, which offers `--narr-voice`. Checked whether
+anything else is lost:
+
+| legacy | studio | verdict |
+|---|---|---|
+| `inputs path(s) to .md, .txt, .pptx` | identical | **preserved** — multi-file survives |
+| `--voice` `--minutes` `--out` | all present | preserved |
+| `-a` / `-v` | `--skip-video` / default | preserved |
+| **`--lang {hi,mr,en}`** | **absent** | **the one real gap** |
+
+`--lang` is mappable — `hi`/`mr` both mean the `mhe-mix` profile, `en` means
+`english` — so a shim can translate it exactly. It cannot express anything
+`--narr-voice` cannot, so nothing is lost by mapping rather than porting.
+
+**Ruling, adopting the review's deprecation shape:** repoint
+`doc-to-video-tutor` at `studio:main`, and leave the old name in place for one
+release cycle raising an **explicit error that names the replacement** — not a
+silent no-op, because a shell alias or CI script calling it today must fail
+loudly rather than quietly change behaviour. `--lang` is translated to
+`--narr-voice` in the message. Deletion is a later, separate decision.
+
+### AJ2. §AA UPHELD — the pause cut is 5 points of a 37-point overrun
+
+The review is right and my own framing was wrong. 137% → ~132% leaves the lesson
+**32% over**, and a checklist entry that reads "duration handled" would hide that.
+Accepted verbatim: reframe as *"reduce pause **and** open a ticket for the real
+overrun"*, so the visible symptom going away cannot make 32%-over the new normal.
+
+### AJ3. The root-cause trace, which the review asked for
+
+`pipeline-architect` check #10 reports *whether* a build is over. What is missing
+is *why*. Traced on v012_015:
+
+```
+505 words, 292.4s of narration, 240s target
+overrun: 52.4s = 21.8 of the 37.2 points
+
+measured speech rate       103.6 wpm
+LOUDNESS_WPM projection    103.0     -> off by 0.6%
+rate needed for 240s       126 wpm
+```
+
+**The projection is not the problem, and neither is the cross-fade.** The lesson
+carries 505 words; at a natural MHE rate that is 292s. Hitting 240s needs ~415
+words — **18% less narration** — or fewer scenes. That is a content decision, not
+a calibration bug, which is why no amount of tuning `LOUDNESS_WPM` moves it.
+
+### AJ4. The cross-fade claim — refuted, with the arithmetic
+
+The review worried the 0.6s cross-fade might eat into the pause, leaving ~0.9s at
+`--pause 1.5`. Measured in `video.py:703-728`: `d += pause` extends the **last
+variant** (an image hold with no audio), the gap is a separate silent
+`AudioClip(duration=pause)`, and `CrossFadeIn(0.6)` is applied at the **head of
+every clip, over speech**. The fade never touches the pause, so the gap stays a
+full 1.5s.
+
+The review's *method* still stands even though its arithmetic was wrong: whether
+1.5s feels rushed is perceptual, and no percentage can answer it. **Listen to two
+or three scene boundaries at 1.5s before fixing the number.**
+
+### AJ5. What this changes
+
+- §AB moves from "needs a decision" to **approved with a specified shim**, and
+  the precondition is discharged: one mappable flag, nothing else lost.
+- §AA splits in two: the pause change is a free 5 points **and now carries an
+  open ticket** for the 21.8 points of narration, which is a content decision
+  about how much a 4-minute target should say.
+
+## AK. §AB and §AA actioned — deprecation shim shipped, duration ticket opened
+
+**228 tests pass.**
+
+### AK1. `doc-to-video-tutor` is now a translating shim
+
+Not repointed silently, and not deleted — a shell alias or CI script calls that
+name today. The entry point now parses the legacy flags, prints a deprecation
+banner to stderr naming the replacement and the exact translated call, and hands
+off to `studio.main()`. Every documented invocation was run end to end against a
+real document: the banner appears, `--lang hi` becomes `--narr-voice mhe-mix`,
+`-a` becomes `--skip-video`, and the build proceeds through studio's **gated**
+pipeline — `[1/5] Planning lesson ... all concepts covered`, not the legacy
+ungated path.
+
+Translation table, with `--lang` the only flag that needed a mapping:
+
+| deprecated | replacement |
+|---|---|
+| `doc.md` positional, multi-file | unchanged |
+| `-a` / `--audio` | `build --skip-video` |
+| `-v` / `--video` | accepted, ignored — video is the default now |
+| `--lang hi` / `mr` / `en` | `--narr-voice mhe-mix` / `mhe-mix` / `english` |
+| `--voice` `--minutes` `--out` | unchanged |
+
+`-v` is accepted rather than rejected, with a note, so an existing invocation
+still runs instead of failing on a flag that became the default. Anything the
+shim cannot translate raises rather than being ignored.
+
+**README rewritten** so the documented command is the gated one. The old name now
+appears only in the deprecation section, with the mapping table — the safety gap
+was that following the docs reached the ungated pipeline.
+
+### AK2. A mistake in my own shim, caught immediately
+
+First end-to-end test failed with `unrecognized arguments: --skip-video`. My
+first assumption was that `studio.main` ignored the argv list — **wrong**; it
+accepts one. The actual cause was that my *test invocation* passed `--skip-video`,
+a studio flag, to the legacy parser. Recorded because the wrong diagnosis was the
+tempting one and would have sent me editing `studio.cli` for no reason.
+
+### AK3. §AA split in two, as ruled — the ticket is the second half
+
+The pause reduction is **not** treated as closing duration. Opened:
+
+> **OPEN — 21.8 points of narration overrun (not the pause).** v012_015 is 137%
+> of a 4-minute target: 15.4 points are structural silence, **21.8 are
+> narration** — 505 words at a measured 103.6 wpm, where `LOUDNESS_WPM` predicts
+> 103.0 (0.6% out, so the projection is not the cause). Reaching 240s needs
+> ~415 words, **18% less narration**, or fewer scenes. This is a content
+> decision about how much a 4-minute target should say, not a calibration bug,
+> and no `LOUDNESS_WPM` tuning moves it.
+
+Reducing `--pause` 3.0 → 1.5 recovers ~13.5s (5 of the 37 points) and is worth
+doing on its own. It is **not** a fix for the 21.8.
+
+Two preconditions recorded before the number is fixed: the 0.6s `CrossFadeIn`
+was measured to sit at the head of each clip **over speech**, not inside the
+pause (`video.py:703-728` — `d += pause` extends an image-only hold, the gap is a
+separate silent `AudioClip`, the fade is applied to every clip's start), so the
+gap stays a full 1.5s. And whether 1.5s *feels* rushed is perceptual — **listen
+to two or three scene boundaries** before fixing the default.
