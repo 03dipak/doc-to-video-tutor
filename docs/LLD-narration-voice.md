@@ -1275,3 +1275,200 @@ warn about nothing, and be one word away from a hard failure that refuses the
 build. That margin is real and is not currently defended. The cheapest honest
 improvement is a warning band between 70 and 90 that says "this scene has no
 headroom", which costs nothing and is decided rather than derived.
+
+## 23. Session addendum — ordering, observability, and provenance
+
+Sixteen changes, all uncommitted, all pinned by regression. Three themes
+recurred often enough to be worth stating as rules rather than as fixes.
+
+### 23.1 Rule: a repair that runs after another repair is looking at a stale plan
+
+Three of today's defects had the same shape — a pass that ran, did its job, and
+was then made irrelevant by a pass ordered after it.
+
+- **The ungrounded drop starved a scene, and nothing noticed.**
+  `_drop_ungrounded_slide_text` runs **last** in the chain
+  (`plan.py:1941`), so `_repair_thin_narrations` (1936) had already run. The
+  thin repair reads `source_chunk` and *raises* its floor when one is present,
+  so the machinery to fix this existed — it was looking at a plan state that no
+  longer existed. On `mod03_gates_v012_014` scene 7 fell to 1 bullet, its
+  narration was 6 content words against a floor of 8, and a 38-second build died
+  at `tts_required_concept_missing`. Fixed by a `_rehydrate_starved_scenes` pass
+  plus a second thin-repair, and **unconditionally** — a plan loaded from disk is
+  already post-drop, so a pass gated on "did the drop fire" never runs.
+- **A pronunciation rule that could never match.** `_spoken_variant` ran
+  `_flatten_parentheses` before `speech_expand`, and flattening replaces every
+  bracket with a space, so `1/(n+1)` became `1/ n+1 ` and the rule written
+  `1/(n+1)` was dead. The same expression was spoken two ways in adjacent clips
+  of one lesson. Swapped; flattening still runs, still last.
+- **Captions on the wrong timeline.** `_write_webvtt` is called at
+  `video.py:786`; the silent title card it cannot know about is prepended at 795.
+  Every cue fired `TITLE_HOLD + pause` = **7.0s** early. Measured: first cue
+  `00:00:00.100` → `00:00:07.100`, last cue end 315.0s → 322.0s against a
+  measured audio end of ~322.3s.
+
+**Rule: when a pass mutates state another pass depends on, either order it first
+or re-run the dependent pass. Do not assume a gate ran on the artifact you are
+about to write.**
+
+### 23.2 Rule: a detector that cannot see the defect class is worse than none
+
+Three detectors were structurally incapable of reporting their own defect, and in
+each case the fix was coverage, not a threshold.
+
+- **`unspoken visual claim` could not see the `design_decision` card** — it
+  checked `status_badges` and `json_snippet` only. Closing it immediately
+  surfaced a live, pre-existing divergence no reviewer had reported: scene 2's
+  card says *"info: recorded for provenance, never a verdict — can't break a
+  build by existing"* while its narration says only *"info = recorded only"* —
+  **23%** of the card's content words spoken. It is prose, so the badge test's
+  token intersection is far too lenient; it now uses a coverage fraction
+  (`_DESIGN_DECISION_SPOKEN_FRACTION = 0.6`).
+- **The TTS residue regex matched only `[{}[]_=]` or `\d+/\d+`.** So `±`, `·`,
+  `≤`, `≥`, `≠` were invisible — and `1/(n+1)` is digit-slash-paren, not
+  digit-slash-digit, so the one expression under discussion never matched either.
+  All now matched. Scene 2 had been carrying a literal `±20%.` into the audio.
+- **The video renderer had no layout guard at all.** `_audit_layout` has covered
+  the PPTX since `43edaa4`; `slides.py`, which draws the MP4 a viewer actually
+  watches, had none. A 6-node diagram row put its last node **58px** past the
+  frame for a whole scene, and the deck audit read clean. The per-node cap
+  `min((1280-120)//n, 230)` ignored the inter-node gap, so the row grew
+  `pitch = w + 24` per node regardless.
+
+### 23.3 Rule: never print a configured constant under a measured label
+
+The build printed `LOUDNESS_TARGET` / `LOUDNESS_TP` — `config.py` constants —
+as `loudness : -16.0 LUFS / -1.5 dBTP`. Actual: **-16.0…-16.6 LUFS, -1.8 dBTP**.
+Three causes had to be fixed before a real number existed: the loudnorm filter
+chain never set `print_format`, the readings were not parsed, and `os.replace`
+could not move the result across a filesystem boundary — so with the output
+directory on another device, normalisation silently skipped **every** clip
+(measured 0/3, now 3/3). The build now reports measured values and labels the
+target separately.
+
+### 23.4 `*.verify.json` — the artifact the build was throwing away
+
+`build` computed the TTS audit, the layout audit, loudness and duration, then
+printed them as stdout no later process could read. Findings survived only inside
+`tts_script.json`; measurements did not survive at all. A reviewer spent 100
+toolcalls reproducing gates that had already run.
+
+Every build now writes one machine-readable file, **on the green path and both
+BLOCKED paths** — a blocked build is when evidence matters most. It carries
+`verdict`, `plan_sha256`, per-gate verdicts, counts, layout findings from **both**
+renderers, measured media, and duration.
+
+**Soft findings were being computed and then filtered out two lines after they
+were produced.** `problems = [p for p in guard_plan(...) if not p.startswith(soft)]`
+meant `source section not covered` and `narration still speaks about` were
+produced on every build and surfaced nowhere. Now split, printed, and recorded.
+
+**Duration is decomposed**, because one number for two causes sent the fix to the
+wrong layer:
+
+| | seconds | % of a 240s target |
+|---|---|---|
+| MP4 | 329.4 | 137.2% |
+| narration audio | 292.4 | 121.8% |
+| structural silence | 37.0 | 15.4% |
+
+The 37s is `TITLE_HOLD` 4.0 + a 3.0s pause after each of 9 scenes + `end_hold` 6.0.
+**None of it is teaching.** `--pause` alone is 27s, or 11% of the target.
+Per-scene share is recorded too: scene 2 is 15.2% of the audio against a 10.0%
+mean, and is the only clip over the 70-word WARN band.
+
+### 23.5 Defect 2d closed — provenance the repairs can actually read
+
+`section_digest` is a digest of `f"{heading}\n{body}"`, so it **cannot be
+recomputed from the chunk**; nothing verified that `source_chunk` still came from
+the section the record names. Both hydration paths — the thin-narration rebuild
+and the starved-scene bullet top-up — read that mutable field directly. A plan
+whose assignment moved on while the chunk did not would hydrate a scene from the
+wrong paragraph: correct-looking prose, wrong content, no finding, no log line.
+
+Assignment records now also carry `chunk_digest`, written at the same moment, and
+`verified_source_chunk(plan, scene_no)` gates both paths. It lives in `util.py`,
+not `plan.py`, because `plan` imports `narration`.
+
+**A pre-existing test caught the first version being too strict:** it refused a
+scene with a `source_chunk` but *no* assignment record. No record is not the same
+as a contradicted one — there is nothing to disagree with, and refusing it breaks
+hand-built and pre-assignment plans for no safety gain.
+
+### 23.6 Adopted: an incomplete-phrase title gate — and a rejected diagnosis
+
+7 of 9 titles on `v012_015` ended mid-phrase and were **spoken verbatim**:
+*"…metadata that"*, *"…the canonical pointer to"*, *"Kind = verdict semantics
+(gate vs"* with an unclosed bracket. All three review agents attributed this to a
+character budget.
+
+**That diagnosis is wrong, and measured.** Every title is 36–41 characters
+against `clip_title`'s 44 limit and `_TITLE_CAP` of 44, so **neither ever fired**.
+The 7B emitted the fragments itself, and the intact concept name was in
+`plan.scenes[*].topic` the whole time. Raising `_TITLE_CAP` would only have
+produced a 60-character fragment.
+
+So it is a semantic gate, and detection is **structural** rather than
+vocabulary-based: `_title_is_fragment` flags a tail from a function-word set or
+unbalanced brackets. That list provably cannot be complete — `clip_title` on the
+scene-2 heading returns *"…metadata that makes"*, which ends on a **verb**, and
+no dangling-word list can enumerate verbs. The repair instead splits on the
+document's own `CONCEPT — qualifier` convention and pools candidates from heading
+and topic, taking the shortest complete form. No English morphology required.
+
+Result: scenes 2/3/8 repaired to `The metric registry`, `Kind = verdict
+semantics`, `active.json`. All within cap, no fragment, no markdown leak, deck
+numbering preserved, `_audit_layout` still clean.
+
+### 23.7 OPEN and larger than any fix above — the two renderers
+
+`mod03_gates_v012_015.pptx` has **11 slides** (`1 / 11 … 11 / 11`); the MP4 drawn
+from the same plan has **12 frames** with a `12 / 12` counter and different block
+order. `pptx.py` and `slides.py` are separate layout implementations.
+
+The content layer is already shared (`pptx.py` imports five helpers from
+`slides.py`); only the drawing is forked — and the deck's layer is the mature one.
+`_shorter_column` existed only in `pptx.py`, so the empty-column defect was fixed
+in the deck and **still shipped in the video**; the same happened for the `(cont.
+N)` marker and, until §23.2, the diagram fit. Three instances of one cause.
+
+**Ruling: the PPTX becomes the single layout authority, staged** — add
+reveal/highlight variants to `pptx.py`, render video frames from PPTX geometry,
+then delete the drawing code from `slides.py`. Rejected "keep both plus an
+agreement test": it detects today's drift, not tomorrow's. Interim: two-column
+takeaways and the continuation marker are now in `slides.py` too, and
+`_shorter_column` is one shared implementation asserted by identity in the
+regression, so a second copy cannot reappear.
+
+### 23.8 OPEN — two entry points, and the documented one is ungated
+
+`pyproject.toml` ships `doc-to-video-tutor = "doc_to_video_tutor:main"` and
+`doc-to-studio = "doc_to_video_tutor.studio:main"`. **Both are live**, with
+different interfaces, and `main`/`ask_llm` are implemented twice. The legacy path
+contains **no grounding, audit, gate or repeat checks at all** — every gate and
+all 223 tests live in `studio`, reachable only via `doc-to-studio`.
+
+`README.md` still instructs `uv run doc-to-video-tutor doc/design/…`. So the
+documented primary command runs the un-gated pipeline, and a user following it
+would hit the §23.1 starvation and the 7-second caption offset with nothing
+reporting either. **Do not delete the file** — it is a shipped command. The
+decision is which implementation is canonical; repointing `doc-to-video-tutor` at
+`studio:main` and keeping `doc-to-studio` as an alias is the recommended path.
+
+### 23.9 Withdrawn after re-measurement — and the pattern that produced both
+
+- **Mono-downmix loudness failure at -19.7 LUFS.** Does not reproduce.
+  `ebur128` stereo **-16.7**, `ebur128 -ac 1` **-16.7**, `loudnorm`'s own summary
+  **-16.8**. The claimed -3.46 dB video-vs-clip trim is 0.6 dB, consistent with
+  mp3 plus a stereo container. `measure_delivery` records both readings on every
+  build — worth keeping *because* it currently passes.
+- **"`verify` deletes 13.4% of teaching content; any re-render creates new
+  findings."** `_repair_unsafe_narrations` does spike to 6 findings and -65 words,
+  but `_repair_thin_narrations` then rebuilds and the chain **ends where it
+  started**: 1 finding, 373 words. The reported state was mid-chain.
+
+Both were reported with exact numbers by a competent reviewer measuring real
+things. The failure was **where the measurement was taken** — a mid-chain
+snapshot read as a final state, and a control file read as the shipped file.
+**Rule: a number taken from the middle of a process must have its endpoint
+stated before it becomes a finding.**
