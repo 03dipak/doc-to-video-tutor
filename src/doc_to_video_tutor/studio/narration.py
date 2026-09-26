@@ -17,6 +17,7 @@ from .text import (
     _nar_tokens,
     _strip_source_citations,
 )
+from .util import verified_source_chunk
 from .voice import _MHE_VOICE, NarrationVoice, _opener_module_name
 
 _REPAIRABLE_TTS_FAILS = frozenset({
@@ -435,11 +436,18 @@ def _repair_thin_narrations(plan: dict, voice: NarrationVoice | None = None,
         # source_chunk) target the ~18-token floor so the hydration is long
         # enough to actually pass the TTS audit instead of minting a 14-word
         # narration that fails it.
+        # Read the chunk through the provenance check rather than off the scene.
+        # Defect 2d: `source_chunk` is a mutable plan field, so a plan whose
+        # assignment moved on while the chunk did not would hydrate this scene
+        # from the wrong section - correct-looking prose, wrong paragraph, and
+        # nothing in the log to say so.
+        chunk = verified_source_chunk(plan, idx)
         floor = _NARR_MIN_TOKENS
-        if str(sc.get("source_chunk", "")).strip():
+        if chunk:
             floor = _NARR_MIN_TOKENS + 6
         banned, _ = _narration_repeat_report(plan, protected)
         rebuilt = _rebuild_scene_narration(sc, idx - 1, scenes, voice,
+                                           source_chunk=chunk,
                                            min_tokens=floor,
                                            blocked_grams=frozenset(banned))
         if not rebuilt or rebuilt == nar:
@@ -473,8 +481,8 @@ def _thin_narration(nar: str, sc: dict, voice: NarrationVoice) -> bool:
 def _rebuild_scene_narration(sc: dict, idx: int, scenes: list[dict],
                              voice: NarrationVoice,
                              min_tokens: int = _NARR_MIN_TOKENS,
-                             blocked_grams: frozenset[str] | None = None
-                             ) -> str:
+                             blocked_grams: frozenset[str] | None = None,
+                             source_chunk: str | None = None) -> str:
     """Deterministic narration for one scene from its validated fields.
 
     Rebuild the spoken track as: opener + design_decision lead + distinct
@@ -529,7 +537,9 @@ def _rebuild_scene_narration(sc: dict, idx: int, scenes: list[dict],
         # new banned repeat. Real doc prose is denser and more unique than the
         # structural template, so this resolves the truly content-starved
         # scene class instead of leaving it for a whole-plan LLM resample.
-        for s in _source_sentences(str(sc.get("source_chunk", ""))):
+        for s in _source_sentences(
+                str(sc.get("source_chunk", "") if source_chunk is None
+                    else source_chunk)):
             if _narration_3grams(s) & other_grams:
                 continue
             parts.append(s)

@@ -14,8 +14,10 @@ from .slides import (
     _json_payload_candidates,
     _parse_diagram,
     _scene_pages,
+    _shorter_column,
     _with_overflow,
     _wrap,
+    mark_continuations,
 )
 from .text import clip_title
 
@@ -216,9 +218,13 @@ def _paginate_by_height(page: dict, budget: float) -> list[dict]:
     return out
 
 
-def _takeaway_pages(takes: list[str], budget: float,
+def _takeaway_pages_measured(takes: list[str], budget: float,
                     col_width: float = 5.9) -> int:
     """How many two-column slides the takeaways need, measured before rendering.
+
+    Named `_measured` to distinguish it from `slides._takeaway_pages_by_count`,
+    which answers the same question arithmetically. Two renderers, two
+    algorithms for one decision - the names keep them from being conflated.
 
     Counted up front so the deck's page counter is honest. The previous fixed
     `rows_per_col` made the count a guess; with overflow now paginating, a wrong
@@ -232,7 +238,11 @@ def _takeaway_pages(takes: list[str], budget: float,
         if max(tops) + need > budget:
             pages += 1
             tops = [0.0, 0.0]
-        col = 0 if (tops[0] + need <= budget) else 1
+        col = _shorter_column(tops)
+        if tops[col] + need > budget:
+            other = 1 - col
+            if tops[other] + need <= budget:
+                col = other
         tops[col] += need + 0.12
         used += 1
     return max(pages, 1 if used else 0)
@@ -303,6 +313,25 @@ def _ppt_codebox(slide, left, top, width, lines, context=""):
         p.font.size = Pt(12)
         p.font.color.rgb = RGBColor(140, 200, 255)
     return tb
+_DIAGRAM_MAX_LABEL = 48
+
+
+def _diagram_height(nodes: list[str], box_w: float) -> float:
+    """Height a diagram needs so no node label spills out of its box.
+
+    The box was a flat 0.68in while node labels are free text at 16pt, so a
+    label like "Absolute/Relative Threshold" or "Deterministic offline gate"
+    wrapped to three lines and overflowed by up to 0.50in - drawn straight over
+    whatever sat below it. Found by the layout audit on mod03_gates_v012_013,
+    which is what the tolerance fix in 43edaa4 bought.
+    """
+    tallest = 0.0
+    for node in nodes:
+        label = str(node)[:_DIAGRAM_MAX_LABEL]
+        tallest = max(tallest, _est_text_height(label, box_w - 0.2, 16))
+    return max(0.68, tallest + 0.16)
+
+
 def _ppt_diagram(slide, left, top, width, nodes) -> float:
     from pptx.dml.color import RGBColor
     from pptx.enum.shapes import MSO_SHAPE
@@ -310,7 +339,7 @@ def _ppt_diagram(slide, left, top, width, nodes) -> float:
 
     gap = 0.22
     box_w = min(2.35, (width - gap * (len(nodes) - 1)) / len(nodes))
-    box_h = 0.68
+    box_h = _diagram_height(nodes, box_w)
     for idx, node in enumerate(nodes):
         x = left + idx * (box_w + gap)
         shape = slide.shapes.add_shape(
@@ -322,7 +351,7 @@ def _ppt_diagram(slide, left, top, width, nodes) -> float:
         tf = shape.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.text = str(node)[:48]
+        p.text = str(node)[:_DIAGRAM_MAX_LABEL]
         p.font.name = "Arial"
         p.font.size = Pt(16)
         p.font.color.rgb = RGBColor(235, 238, 245)
@@ -459,7 +488,66 @@ def _video_blocks(scene: dict) -> set[str]:
                 break
             yy += 40
     return blocks
-def build_pptx(plan: dict, out_path: Path) -> None:
+# Vertical budget for a scene page: 1.7in top to the 6.9in safe bottom, less the
+# block label. Module-level rather than local to `build_pptx` because
+# `reveal_plan` must enumerate pages exactly as `build_pptx` does, and two
+# copies of that enumeration is how a renderer drifts from itself.
+_BODY_BUDGET = 4.86
+
+
+def reveal_variants(scene: dict) -> list[tuple[int | None, int | None]]:
+    """The `(reveal_upto, highlight)` pairs for one scene, matching the video.
+
+    Mirrors `slides._slide_variants`: a scene with `n` bullets yields `n + 1`
+    frames, frame `k` showing `bullets[:k]` with bullet `k-1` highlighted, and a
+    scene with nothing to reveal yields a single uncut variant. The video pairs
+    these with audio segments; the deck now produces the same sequence so one
+    layout can drive both.
+    """
+    from .slides import _with_overflow
+
+    count = len(_with_overflow(scene.get("bullets")
+                               or scene.get("takeaways") or []))
+    if not count:
+        return [(None, None)]
+    return [(k, k - 1 if k else None) for k in range(count + 1)]
+
+
+def reveal_plan(plan: dict, step: int) -> dict[int, tuple[int | None, int | None]]:
+    """`reveal` map for reveal step `step` across every scene page in `plan`.
+
+    Page indices count the deck body the way the counter does, so a caller
+    stepping 0, 1, 2 ... gets a coherent lesson-wide reveal rather than one
+    scene at a time.
+    """
+    pages: list[dict] = []
+    for scene in plan.get("scenes") or []:
+        for planned in _scene_pages(scene):
+            pages.extend(_paginate_by_height(planned, _BODY_BUDGET))
+    out: dict[int, tuple[int | None, int | None]] = {}
+    for i, page in enumerate(pages, 1):
+        variants = reveal_variants(page)
+        out[i] = variants[step] if step < len(variants) else variants[-1]
+    return out
+
+
+def build_pptx(plan: dict, out_path: Path,
+               reveal: dict[int, tuple[int | None, int | None]] | None = None
+               ) -> None:
+    """Render the deck.
+
+    `reveal` maps a 1-based scene-page index to `(reveal_upto, highlight)` and
+    is the deck-side half of the video's progressive reveal - the single
+    capability `pptx.py` lacked, and the gate on consolidating the two renderers
+    (LLD 23.7). The video emits `count + 1` frames per scene, frame `k` showing
+    `bullets[:k]` with bullet `k-1` highlighted; this produces the same
+    variants.
+
+    **Space is reserved for every bullet whether or not it is drawn**, so the
+    layout is byte-identical across variants and nothing reflows as the reveal
+    advances. That is the property the video relies on and the reason reveal is
+    a drawing concern only, not a budget one.
+    """
     from pptx import Presentation
 
     prs = Presentation()
@@ -476,15 +564,20 @@ def build_pptx(plan: dict, out_path: Path) -> None:
     # Count-based pagination alone is not enough, because bullet length varies by
     # an order of magnitude and the row stack would then drop teaching content to
     # protect the layout.
-    _BODY_BUDGET = 4.86          # 1.7in top .. 6.9in safe bottom, less the label
+
     page_scenes: list[dict] = []
     for scene in plan["scenes"]:
         for planned in _scene_pages(scene):
             page_scenes.extend(_paginate_by_height(planned, _BODY_BUDGET))
+    # Numbered after ALL splitting, not before: the deck splits by measured
+    # height as well as by count, so it can end up with more pages than
+    # `_scene_pages` produced, and a marker applied earlier would number the
+    # wrong pages.
+    mark_continuations(page_scenes)
     takes = (plan.get("takeaways") or [])[:8]
     # The takeaway slides paginate, so their count has to be measured
     # before the deck total is fixed or the counter prints "7 / 6".
-    take_pages = _takeaway_pages(takes, 6.9 - 1.7) if takes else 0
+    take_pages = _takeaway_pages_measured(takes, 6.9 - 1.7) if takes else 0
     deck_total = len(page_scenes) + (1 + take_pages if takes else 1)
 
     s = prs.slides.add_slide(blank)
@@ -520,7 +613,14 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         y = stack.y
         bullets = _with_overflow(scene.get("bullets")
                                   or scene.get("takeaways") or [])
-        for b in bullets:
+        # `reveal_upto` is None for the final variant and for a page with nothing
+        # to reveal, matching the video's `_slide_variants`.
+        # `i` is the 1-based index of this scene page within the deck body,
+        # matching the counter and the key `reveal` is given.
+        _cut, _hot = (reveal or {}).get(i + 1, (None, None))
+        for b_idx, b in enumerate(bullets):
+            if _cut is not None and b_idx >= _cut:
+                break
             # Size the row to the text. The previous rule added a flat 0.12 in to
             # anything over 90 characters, which covered a 100-char bullet and
             # left a 271-char one spilling a third of an inch past its box and
@@ -529,8 +629,11 @@ def build_pptx(plan: dict, out_path: Path) -> None:
             at = stack.reserve(need, _RowStack.REQUIRED, f"bullet {b[:24]}")
             if at is None:
                 break  # required content is out of room; stop, never clip
-            _ppt_textbox(s, 0.52, at, 12.3, need, b, 18, (235, 238, 245),
-                         bullet=True)
+            if _cut is None or b_idx < _cut:
+                hot = _hot is not None and b_idx == _hot
+                _ppt_textbox(s, 0.52, at, 12.3, need, b, 18,
+                             (255, 255, 255) if hot else (235, 238, 245),
+                             bullet=True, bold=hot)
             y = stack.y
 
         if scene.get("status_badges") and "status_badges" in _video_blocks(scene):
@@ -609,9 +712,14 @@ def build_pptx(plan: dict, out_path: Path) -> None:
         # ran from 5.59in to 7.78in, a full inch past the 6.9in safe bottom.
         # Two cursors, one of them stale, is the failure mode a single shared
         # budget exists to prevent.
-        if diagram and stack.reserve(0.9, _RowStack.OPTIONAL, "diagram") is not None:
-            _ppt_diagram(s, 0.52, y, 12.3, diagram)
-            y = stack.y
+        if diagram:
+            _dgap = 0.22
+            _dw = min(2.35, (12.3 - _dgap * (len(diagram) - 1)) / len(diagram))
+            _dh = _diagram_height(diagram, _dw)
+            if stack.reserve(_dh + 0.1, _RowStack.OPTIONAL,
+                             "diagram") is not None:
+                _ppt_diagram(s, 0.52, y, 12.3, diagram)
+                y = stack.y
 
         code_text = scene.get("code_snippet")
         if code_text and "code" in _video_blocks(scene):
@@ -720,10 +828,20 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                                                   col_width - 0.25, 18))
                 if max(col_tops) + need > top + budget:
                     break
-                col = 0 if (col_tops[0] + need <= top + budget) else 1
+                col = _shorter_column(col_tops)
+                if col_tops[col] + need > top + budget:
+                    other = 1 - col
+                    if col_tops[other] + need <= top + budget:
+                        col = other
                 take = pending.pop(0)
-                _ppt_textbox(s, col_x[col], col_tops[col], col_width, need,
-                             take, 18, (235, 238, 245), bullet=True)
+                card = _ppt_textbox(s, col_x[col], col_tops[col], col_width,
+                                    need, take, 18, (235, 238, 245),
+                                    bullet=True)
+                # Label the column family. The auditor still measures real
+                # geometry from the written file - it just needs a reliable way
+                # to tell a column card from a full-width block, which pure
+                # position cannot do on a slide that mixes both.
+                card.name = f"takeaway col {col}"
                 col_tops[col] += need + 0.12
                 placed_here += 1
             if not placed_here:
@@ -732,8 +850,11 @@ def build_pptx(plan: dict, out_path: Path) -> None:
                 take = pending.pop(0)
                 need = min(max(0.5, _est_text_height(take, col_width - 0.25, 18)),
                            budget)
-                _ppt_textbox(s, col_x[0], top, col_width, need, take, 18,
-                             (235, 238, 245), bullet=True)
+                lone = _ppt_textbox(s, col_x[0], top, col_width, need, take,
+                                    18, (235, 238, 245), bullet=True)
+                # Deliberately not a column card: this page holds one item that
+                # no column could hold, and it is already reported below.
+                lone.name = "takeaway single"
                 # `deck_total` is a count of slides, not this slide's index, and
                 # with takeaway pagination they differ. Use the same arithmetic
                 # as the counter: title + scene slides + this takeaway page.
@@ -746,6 +867,24 @@ def build_pptx(plan: dict, out_path: Path) -> None:
     prs.save(str(out_path))
     print(f"Deck written: {out_path}")
     _audit_layout(out_path)
+
+
+# A label laid flush on its card's edge is contained, not overlapping. The card
+# and its text are positioned by independent Inches() calls, so their edges can
+# differ by a single EMU - measured at exactly 1 EMU (1.09e-06 in) on the
+# payload card - and an exact comparison then reports a full-height overlap of a
+# perfectly nested label. This slack is five orders of magnitude smaller than any
+# real overlap and two larger than the rounding it absorbs.
+_CONTAIN_SLACK_EMU = 9144  # 0.01 in
+
+
+def _contains(outer, inner) -> bool:
+    """Is `inner` fully inside `outer`, allowing for edge rounding?"""
+    s = _CONTAIN_SLACK_EMU
+    return bool(outer.left - s <= inner.left
+                and outer.top - s <= inner.top
+                and outer.left + outer.width + s >= inner.left + inner.width
+                and outer.top + outer.height + s >= inner.top + inner.height)
 
 
 # Text taller than its box is not clipped by PowerPoint, it is drawn over
@@ -763,6 +902,40 @@ _AUDIT_OVERLAP_TOL = 0.01
 _AUDIT_OVERFLOW_TOL = 0.12
 
 
+_COLUMN_FAMILY = "takeaway col "
+
+
+def _column_balance(slide, index: int) -> list[str]:
+    """Flag a two-column page that only ever filled one column.
+
+    The takeaway bug this catches was invisible to the other three checks and to
+    geometry alone: every card was positioned legally, inside the safe area,
+    overlapping nothing. It only looked wrong. `_shorter_column` fixed the
+    placement, but placement logic silently regresses, so the property is
+    asserted here against the written file instead of being re-derived from the
+    same variable that broke.
+
+    One card alone is not flagged: a takeaway taller than a column is a real
+    case, and the builder already reports it as a clipped single-slide page.
+    """
+    cols: dict[int, int] = {}
+    for sh in slide.shapes:
+        name = sh.name or ""
+        if not name.startswith(_COLUMN_FAMILY):
+            continue
+        try:
+            col = int(name[len(_COLUMN_FAMILY):])
+        except ValueError:
+            continue
+        cols[col] = cols.get(col, 0) + 1
+    if len(cols) < 2 and max(cols.values(), default=0) >= 2:
+        filled = max(cols, key=lambda c: cols[c])
+        return [f"slide {index}: two-column page has {cols[filled]} cards in "
+                f"column {filled} and none in the other - a card was placed by "
+                f"column position rather than by the shorter column"]
+    return []
+
+
 def _audit_layout(out_path: Path) -> list[str]:
     """Report layout defects in a written deck: overflow, overlap, safe area.
 
@@ -772,6 +945,11 @@ def _audit_layout(out_path: Path) -> list[str]:
     while the text visibly spills across the card beneath it. Only the three
     checks that can be decided without a renderer are automated - judgement
     calls like "does this decorative element earn its place" stay with a human.
+
+    A fourth check, column balance, is here rather than left to a rendering
+    agent on purpose: it is pure geometry once the cards are labelled, so it
+    costs nothing and catches the regression on every build instead of whenever
+    someone remembers to look.
     """
     from pptx import Presentation
 
@@ -779,6 +957,7 @@ def _audit_layout(out_path: Path) -> list[str]:
     prs = Presentation(str(out_path))
     emu = 914400.0
     for index, slide in enumerate(prs.slides, 1):
+        findings.extend(_column_balance(slide, index))
         shapes = [sh for sh in slide.shapes if sh.width and sh.height]
         for sh in shapes:
             if not sh.has_text_frame:
@@ -814,14 +993,7 @@ def _audit_layout(out_path: Path) -> list[str]:
                       - max(A.top, B.top)) / emu
                 if ox <= _AUDIT_OVERLAP_TOL or oy <= _AUDIT_OVERLAP_TOL:
                     continue
-                contained = (
-                    (A.left <= B.left and A.top <= B.top
-                     and A.left + A.width >= B.left + B.width
-                     and A.top + A.height >= B.top + B.height)
-                    or (B.left <= A.left and B.top <= A.top
-                        and B.left + B.width >= A.left + A.width
-                        and B.top + B.height >= A.top + A.height))
-                if contained:
+                if _contains(A, B) or _contains(B, A):
                     continue  # a label sitting inside its own card
                 findings.append(
                     f"slide {index}: shapes overlap by {ox:.2f}x{oy:.2f}in")

@@ -9,7 +9,13 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
-from .config import _REPEAT_POLICY_VERSION, _SCHEMA_VERSION, _SOFT_PREFIXES, LOUDNESS_WPM
+from .config import (
+    _REPEAT_POLICY_VERSION,
+    _SCHEMA_VERSION,
+    _SOFT_PREFIXES,
+    LOUDNESS_WPM,
+    TITLE_HOLD,
+)
 from .llm import _extract_topics
 from .narration import (
     _dedupe_narration_templates,
@@ -28,8 +34,10 @@ from .plan import (
     _prune_bullet_takeaway_echo,
     _sanitize_design_decisions,
     _sanitize_plan_source_leaks,
+    _unclaimed_source_sections,
     plan_lesson,
 )
+from .slides import LAYOUT_NOTES
 from .speech import build_tts_script, render_script_txt
 from .text import (
     _content_ngrams,
@@ -40,7 +48,7 @@ from .text import (
 )
 from .util import _wait_before_retry, atomic_json_write, file_digest, load_documents
 from .validate import _render_blocking_problems, check_audit_binding, guard_plan, review_plan
-from .video import _render_media
+from .video import _render_media, measure_delivery
 from .voice import _make_voice, _voice_fingerprint
 
 # Sample-boundary gates that plan_lesson's deterministic chain already repaired
@@ -129,6 +137,119 @@ def _clip_probe_voice(profile, override):
     if not voice:
         raise SystemExit("tts-check: the voice profile has no concrete tts_voice")
     return voice, profile.rate, profile.pitch, profile.volume
+
+
+def _write_verify_artifact(out_base: Path, plan_doc: dict, plan: dict,
+                          script: dict, args, *, verdict: str,
+                          soft: list[str] | None = None,
+                          blockers: list[dict] | None = None,
+                          blocking: list[str] | None = None) -> Path:
+    """Write the per-run evidence file. The artifact the build was throwing away.
+
+    The build computes the TTS audit, the layout audit, loudness and duration,
+    then prints them as stdout no later process can read. The findings survived
+    only inside `tts_script.json`; the measurements did not survive at all. So
+    every reviewer re-derived them - one spent 100 toolcalls reproducing gates
+    that had already run. This file is the durable form: measured values, gate
+    verdicts, and the plan digest, so cross-artifact review becomes checking
+    rather than re-deriving.
+
+    It is also what makes the L4 gap impossible to hit again: `soft` findings
+    used to be computed and then filtered out a few lines above where they were
+    produced, so `source section not covered` and `narration still speaks
+    about` never appeared anywhere a human would see them.
+    """
+    scenes = plan.get("scenes") or []
+    clips = script.get("clips") or []
+    words = sum(int(c.get("word_count") or 0) for c in clips)
+    audio_dir = Path(f"{out_base}_audio")
+    doc: dict = {
+        "schema_version": 1,
+        "verdict": verdict,
+        "plan_path": str(Path(f"{out_base}.plan.json")),
+        # The digest `check_audit_binding` compares, so a green build finally
+        # has something to bind against.
+        "plan_sha256": file_digest(Path(f"{out_base}.plan.json"))
+        if Path(f"{out_base}.plan.json").exists() else None,
+        "target_minutes": float(getattr(args, "minutes", 0) or 0),
+        "gates": {
+            "review_before_build": {
+                "soft": list(soft or []),
+            },
+            "pre_audio": {"findings": list(blockers or [])},
+            "pre_render": {"findings": list(blocking or [])},
+        },
+        "counts": {
+            "scenes": len(scenes),
+            "clips": len(clips),
+            "audio_files": len(sorted(audio_dir.glob("*.mp3"))) if audio_dir.exists() else 0,
+            "narration_words": words,
+            "bullets_per_scene": [len(s.get("bullets") or []) for s in scenes],
+            "dropped_slide_text": len(plan.get("dropped_slide_text") or []),
+            # The count that was missing, not the total: naming a field
+            # "unclaimed" while filling it with every section in the document
+            # is the same class of bug as printing a config constant under a
+            # "loudness :" label.
+            "source_sections": len(plan.get("source_sections") or []),
+            "unclaimed_source_sections": len(_unclaimed_source_sections(plan)),
+        },
+        "layout": {
+            "pptx": list(plan.get("_layout_findings") or []),
+            "slides": list(LAYOUT_NOTES),
+        },
+        "media": measure_delivery(out_base),
+    }
+    # Duration as a ratio, per surface. The mp4 is what a viewer experiences and
+    # it is materially longer than the audio, because of the title hold and the
+    # inter-scene pauses; reporting only the audio understates it by ~17 points.
+    media = doc["media"]
+    secs = media.get("seconds")
+    target = doc["target_minutes"] * 60.0
+    if secs and target > 0:
+        pct = round(secs / target * 100.0, 1)
+        # Decomposed, because "137% of target" reads as a content problem when
+        # most of it is not content. Measured on v012_015: the MP4 is 326s
+        # against a 240s target, and 37s of that is structural silence -
+        # TITLE_HOLD 4.0 plus a 3.0s pause after each of 9 scenes plus a 6.0s
+        # end hold. The teaching audio is 289s (120%). One number for both made
+        # a configurable inter-scene pause look like a lesson that taught too
+        # much, and sent the fix to the wrong layer.
+        n_scene = len(scenes)
+        gap = float(getattr(args, "pause", 3.0) or 0.0)
+        silence = TITLE_HOLD + gap * n_scene + float(
+            getattr(args, "end_hold", 6.0) or 0.0)
+        audio_s = max(0.0, secs - silence)
+        doc["duration"] = {
+            "mp4_seconds": secs,
+            "mp4_pct_of_target": pct,
+            "band": "LONG" if pct > 115 else ("SHORT" if pct < 70 else "OK"),
+            "narration_seconds": round(audio_s, 1),
+            "narration_pct_of_target": round(audio_s / target * 100.0, 1),
+            "structural_silence_seconds": round(silence, 1),
+            "structural_silence_pct_of_target": round(
+                silence / target * 100.0, 1),
+            "inter_scene_gap_seconds": gap,
+            "scenes": n_scene,
+        }
+        # Per-scene share, so an outlier is visible as a number. Scene 2 on
+        # v012_015 was 14.8% of the audio against a 9.4% mean, and it is the
+        # only scene over the 70-word WARN band.
+        shares = []
+        for c in clips:
+            w = int(c.get("word_count") or 0)
+            if w and audio_s > 0:
+                shares.append({"index": c.get("index"), "role": c.get("role"),
+                               "words": w,
+                               "pct_of_audio": round(w / max(1, words) * 100.0, 1)})
+        if shares:
+            mean = sum(s["pct_of_audio"] for s in shares) / len(shares)
+            doc["duration"]["scene_share_pct"] = shares
+            doc["duration"]["scene_share_mean_pct"] = round(mean, 1)
+            doc["duration"]["scene_share_outliers"] = [
+                s for s in shares if s["pct_of_audio"] > mean * 1.4]
+    out = Path(f"{out_base}.verify.json")
+    atomic_json_write(out, doc)
+    return out
 
 
 def _write_tts_artifacts(out_base: Path, script: dict, args) -> None:
@@ -579,10 +700,18 @@ def main(argv: list[str] | None = None) -> None:
         atomic_json_write(
             Path(f"{out_base}.sample{sample}.plan.json"),
             _doc_for(sampled_plan, lesson_topics, sampled_script))
-        problems = [p for p in guard_plan(
+        all_problems = guard_plan(
             sampled_plan, lesson_topics, source_bigrams=sorted(" ".join(g) for g in ngrams),
             source_tokens=sorted(tokens), source_top=top_terms, voice=narrvoice)
-            if not any(p.startswith(soft) for soft in soft_prefixes)]
+        # Split instead of filtering. `soft_problems` used to be computed and
+        # then thrown away two lines down, which is the whole of the L4 gap:
+        # `source section not covered` and `narration still speaks about` were
+        # produced on every build and surfaced nowhere. They now reach both the
+        # build log and the verify artifact.
+        soft_problems = [p for p in all_problems
+                         if any(p.startswith(soft) for soft in soft_prefixes)]
+        problems = [p for p in all_problems
+                    if not any(p.startswith(soft) for soft in soft_prefixes)]
         if not problems:
             break
         if sample < max_samples:
@@ -620,8 +749,16 @@ def main(argv: list[str] | None = None) -> None:
         _write_rejected_tts_script(out_base, script,
                                    str(out_base.with_suffix(".plan.json")),
                                    tts_blockers)
+        # A blocked build is exactly when the evidence matters most, so the
+        # artifact is written on this path too - not only when everything
+        # passes. R4 ruled the audit rejection-only by design; this is the same
+        # reasoning applied consistently.
+        _write_verify_artifact(out_base, plan_doc, plan, script, args,
+                              verdict="BLOCKED", soft=soft_problems,
+                              blockers=tts_blockers)
         print(f"  rejected tts_script written to "
               f"{out_base}.rejected.tts_script.json")
+        print(f"  evidence    : {out_base}.verify.json")
         print("  fix: `verify "
               f"{out_base.with_suffix('.plan.json')}` (deterministic, no LLM) "
               f"or rebuild the lesson.")
@@ -640,10 +777,27 @@ def main(argv: list[str] | None = None) -> None:
             "findings": blocking,
             "plan_path": str(out_base.with_suffix(".plan.json")),
         })
+        _write_verify_artifact(out_base, plan_doc, plan, script, args,
+                              verdict="BLOCKED", soft=soft_problems,
+                              blocking=blocking)
+        print(f"  evidence    : {out_base}.verify.json")
         print(f"  rejected plan + audit written; fix with `verify "
               f"{out_base.with_suffix('.plan.json')}` or rebuild the lesson.")
         raise SystemExit(1)
     _write_tts_artifacts(out_base, script, args)
     _render_media(plan, out_base, script, args.voice, args.skip_video, args.pause)
+    for note in dict.fromkeys(LAYOUT_NOTES):
+        soft_problems.append(note)
+    verify_path = _write_verify_artifact(
+        out_base, plan_doc, plan, script, args, verdict="PASS",
+        soft=soft_problems)
+    if soft_problems:
+        uniq = list(dict.fromkeys(soft_problems))
+        print(f"  soft findings: {len(uniq)} (advisory, non-blocking)")
+        for note in uniq[:6]:
+            print(f"    - {note}")
+        if len(uniq) > 6:
+            print(f"    ... +{len(uniq) - 6} more")
+    print(f"  evidence    : {verify_path.name}")
     if not args.skip_video:
         print(f"  Total pipeline time: {time.monotonic() - t0:.0f}s")

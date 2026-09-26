@@ -166,7 +166,44 @@ def speech_expand(text: str, rules: tuple[PronunciationRule, ...]) -> str:
     def _repl(m: re.Match[str]) -> str:
         idx = m.lastindex
         return spoken_by_group[str(idx - 1)] if idx is not None else m.group(0)
-    return expand_snake_case(combined.sub(_repl, text))
+    return _speak_math_symbols(expand_snake_case(combined.sub(_repl, text)))
+
+
+# Symbols that a TTS engine either skips or reads as punctuation, so a slide
+# says one thing and the audio says nothing. Universal rather than MHE-specific,
+# because no voice reads them correctly: the corpus is full of tolerances and
+# percentages, and on v012_015 scene 2 carried a literal "+-20%." into the
+# spoken track - the audit's residue regex matched only `[{}[]_=]` or `\d+/\d+`,
+# so it never saw them.
+_MATH_SYMBOLS = (
+    ("<=", " at most "),
+    (">=", " at least "),
+    ("!=", " not equal to "),
+    ("\u00b1", " plus or minus "),   # +-
+    ("\u2264", " at most "),         # <=
+    ("\u2265", " at least "),        # >=
+    ("\u2260", " not equal to "),    # !=
+    ("\u00b7", ", "),                # middot separator
+    ("%", " percent "),
+)
+# Each replacement is padded so a token never fuses with its neighbour; the
+# padding is pulled back off adjacent punctuation afterwards, or "20%" becomes
+# "20 percent ."
+_TRAILING_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,;:!?])")
+
+
+def _speak_math_symbols(text: str) -> str:
+    """Replace symbols a voice will not speak. Runs after the rule table.
+
+    Ordering note: the rule table is matched against the *written* text, so this
+    must not run before it. A `PronunciationRule` for "+-0.03" is more specific
+    than this pass and must win.
+    """
+    for symbol, spoken in _MATH_SYMBOLS:
+        if symbol in text:
+            text = text.replace(symbol, spoken)
+    text = _TRAILING_SPACE_BEFORE_PUNCT.sub(r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def _flatten_parentheses(text: str) -> str:
@@ -175,7 +212,15 @@ def _flatten_parentheses(text: str) -> str:
     text = re.sub(r"[({\[}\])]", " ", text)
     text = text.replace("`", " ").replace("'", "").replace("\u201c", " ")
     text = text.replace("\u2014", ", ").replace("\u2013", ", ")
-    text = re.sub(r"(?<!\w)\d{1,2}[.):]\s+", "", text)
+    # An enumerator is only a list marker at a clause boundary. The guard used
+    # to be `(?<!\w)`, which tests the single character before the digits - in
+    # "Exit 3: structural error" that character is a space, so the assertion
+    # passed and the whole identifier was deleted. Narration lost "Exit 3" and
+    # "Exit 4" and became "Exit structural error. Exit data inconsistency.",
+    # which teaches nothing; the pre-audio gate then blocked the build for
+    # transition-only content that the defect had manufactured. The wrong
+    # comparison was one character where a boundary was required.
+    text = re.sub(r"(^|[.!?\u0964\u0965])\s*\d{1,2}[.):]\s+", r"\1 ", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"(?<=\d)\s*\.\s*(?=[A-Za-z\u0900-\u097F])", ", ", text)
     return text
@@ -235,8 +280,18 @@ def repair_speech_punctuation(text: str) -> tuple[str, int]:
 
 def _spoken_variant(voice: NarrationVoice, written: str) -> str:
     text, _hits = strip_slide_meta(written, voice.spoken_meta_leaks)
-    text = _flatten_parentheses(text)
+    # Expand BEFORE flattening, not after. `_flatten_parentheses` replaces every
+    # bracket with a space, so `1/(n+1)` becomes `1/ n+1 ` and the pronunciation
+    # rule written='1/(n+1)' can never match. The same expression was therefore
+    # spoken two different ways in adjacent clips of one lesson - "one / n plus
+    # one" in scene 4, "one over n plus one" in scene 5 - because only the scene
+    # that happened to spell it out in words was correct.
+    #
+    # The literal rules are matched against the written text, so anything that
+    # destroys the literal must run afterwards. Flattening still runs, and still
+    # last, so nothing that needs flattening is left undone.
     text = speech_expand(text, voice.pronunciation_rules)
+    text = _flatten_parentheses(text)
     text, _fixed = repair_speech_punctuation(text)
     return text
 
@@ -351,7 +406,8 @@ def audit_tts_script(clips: list[dict], voice: NarrationVoice,
             findings.append(TtsFinding(
                 "tts_symbol_heavy", "FAIL",
                 f"{tag} raw slide symbol/number/file token remains: {residual.group(0)!r}"))
-        elif re.search(r"[{}\[\]_=]|(?<!\w)\d+/\d+", spoken):
+        elif re.search(r"[{}\[\]_=]|(?<!\w)\d+/\d+|(?<!\w)\d+/\(|"
+                       r"\u00b1|\u00b7|\u2264|\u2265|\u2260|\d%", spoken):
             findings.append(TtsFinding("tts_code_fragment", "WARN",
                                        f"{tag} unexpanded code/symbol token remains"))
         unbalanced = (spoken.count("(") != spoken.count(")")
@@ -521,6 +577,12 @@ def build_tts_script(plan: dict, voice: NarrationVoice) -> dict:
         spoken_title, _t = strip_slide_meta(title, voice.spoken_meta_leaks)
         slide_meta_hits = _m + _t
         spoken_title = re.sub(r"^\s*\d+[.)]\s*", "", spoken_title).strip()
+        # A `(cont. N)` marker is a visual pagination aid, never content. It is
+        # stripped from the title when the deck is built, but a paginated scene
+        # carries it into `spoken_title` too, and without this the narrator reads
+        # "Baseline snapshot and compare cont two" out loud.
+        spoken_title = re.sub(r"\s*\(cont\.\s*\d+\)\s*$", "",
+                              spoken_title, flags=re.IGNORECASE).strip()
         spoken_title = speech_expand(spoken_title, voice.pronunciation_rules)
         spoken_title = _flatten_parentheses(spoken_title)
         spoken_title = repair_speech_punctuation(spoken_title)[0]

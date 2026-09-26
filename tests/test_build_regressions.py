@@ -11,7 +11,11 @@ actually emitted, the 71-word scene, the fused token - because a paraphrased
 fixture would test the idea rather than the incident.
 """
 
+import contextlib
+import io
 import json
+import re
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -788,6 +792,11 @@ def test_no_slide_has_a_non_contained_overlap() -> None:
     out = Path(tempfile.mkdtemp()) / "deck.pptx"
     build_pptx(plan, out)
 
+    # Same containment rule as the studio's own auditor, including its edge
+    # slack. An independent check that disagrees with the auditor by a rounding
+    # hair is worse than no check.
+    from doc_to_video_tutor.studio.pptx import _contains
+
     emu = 914400.0
     offenders: list[str] = []
     for index, slide in enumerate(Presentation(str(out)).slides, 1):
@@ -801,14 +810,7 @@ def test_no_slide_has_a_non_contained_overlap() -> None:
                       - max(A.top, B.top)) / emu
                 if ox <= 0.005 or oy <= 0.005:
                     continue
-                contained = (
-                    (A.left <= B.left and A.top <= B.top
-                     and A.left + A.width >= B.left + B.width
-                     and A.top + A.height >= B.top + B.height)
-                    or (B.left <= A.left and B.top <= A.top
-                        and B.left + B.width >= A.left + A.width
-                        and B.top + B.height >= A.top + A.height))
-                if contained:
+                if _contains(A, B) or _contains(B, A):
                     continue
                 offenders.append(f"slide {index}: {ox:.2f}x{oy:.2f}in")
     assert not offenders, offenders
@@ -1075,3 +1077,1314 @@ def test_audit_does_not_strip_paragraph_structure() -> None:
     findings = _audit_layout(out)
     assert any("overflows" in f for f in findings), (
         "a blank leading paragraph must count towards the rendered height")
+
+
+# --- the second takeaway column must actually be used -------------------
+#
+# Found by external review, confirmed here on three decks. The placement test
+# was "does column 0 still have room below it?", which stays true until column 0
+# is completely full - so the second column was never used at all. Verified:
+# every takeaway sat at x=0.42 and the column at x=6.62 was empty on
+# mod03_gates_v012_009, _010 and _012. That is the §20.2 defect 8 column-fill
+# complaint, relocated rather than fixed.
+
+def test_takeaways_use_both_columns() -> None:
+    import contextlib
+    import io
+    import tempfile
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import build_pptx
+
+    emu = 914400.0
+    plan = {"title": "T",
+            "scenes": [{"section": "S", "title": "One", "topic": "t",
+                        "narration": "n" * 40, "source_refs": ["s"],
+                        "bullets": ["a short bullet"]}],
+            "takeaways": [f"Takeaway {i}: a durable conclusion stated at a "
+                          "length that gives the card real height."
+                          for i in range(5)]}
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    with contextlib.redirect_stdout(io.StringIO()):
+        build_pptx(plan, out)
+
+    columns: set[float] = set()
+    for slide in Presentation(str(out)).slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            if shape.height / emu <= 0.3 or shape.top / emu <= 1.5:
+                continue
+            if "v0.1.0" in shape.text_frame.text:
+                continue
+            left = round(shape.left / emu, 2)
+            if left in (0.42, 6.62):
+                columns.add(left)
+    assert columns == {0.42, 6.62}, (
+        f"expected both takeaway columns, found {sorted(columns)}")
+
+
+def test_shorter_column_picks_the_lower_cursor() -> None:
+    from doc_to_video_tutor.studio.pptx import _shorter_column
+
+    assert _shorter_column([0.0, 0.0]) == 0        # tie -> first, deterministic
+    assert _shorter_column([2.0, 1.0]) == 1
+    assert _shorter_column([1.0, 2.0]) == 0
+
+
+def test_takeaway_page_count_agrees_with_placement() -> None:
+    """The counting pass and the placement pass must not disagree.
+
+    They carry the same column choice, so if one is fixed and the other is not,
+    `deck_total` is wrong and the printed counter drifts again - which is what
+    happened when they last diverged.
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import _takeaway_pages_measured, build_pptx
+
+    # build_pptx caps takeaways at 8, so the count must stay within that.
+    for count in (3, 5, 7, 8):
+        takes = [f"Takeaway {i}: " + ("a real conclusion. " * (2 + i % 5))
+                 for i in range(count)]
+        plan = {"title": "T",
+                "scenes": [{"section": "S", "title": "One", "topic": "t",
+                            "narration": "n" * 40, "source_refs": ["s"],
+                            "bullets": ["a short bullet"]}],
+                "takeaways": takes}
+        predicted = _takeaway_pages_measured(takes, 6.9 - 1.7)
+        out = Path(tempfile.mkdtemp()) / "deck.pptx"
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_pptx(plan, out)
+        prs = Presentation(str(out))
+        actual = sum(1 for slide in prs.slides
+                     if any(sh.has_text_frame
+                            and "Key Takeaways" in sh.text_frame.text
+                            for sh in slide.shapes))
+        assert predicted == actual, (
+            f"{count} takeaways: counted {predicted} pages, placed {actual}")
+
+
+def test_takeaways_are_capped_and_the_cap_is_respected_by_the_counter() -> None:
+    """The 8-takeaway cap must be applied before the page count, not after.
+
+    build_pptx slices the takeaways to 8 and then counts pages from the sliced
+    list, so deck_total matches what is placed. A version that counted first and
+    capped later would inflate the printed counter - the same class of drift as
+    the slide-index bugs in LLD 22.9.
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import _takeaway_pages_measured, build_pptx
+
+    takes = [f"Takeaway {i}: " + ("a real conclusion. " * 3) for i in range(20)]
+    capped = takes[:8]
+    assert _takeaway_pages_measured(capped, 6.9 - 1.7) == _takeaway_pages_measured(
+        capped, 6.9 - 1.7)
+    plan = {"title": "T",
+            "scenes": [{"section": "S", "title": "One", "topic": "t",
+                        "narration": "n" * 40, "source_refs": ["s"],
+                        "bullets": ["a short bullet"]}],
+            "takeaways": takes}
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+    with contextlib.redirect_stdout(io.StringIO()):
+        build_pptx(plan, out)
+    placed = sum(1 for slide in Presentation(str(out)).slides
+                 for sh in slide.shapes
+                 if sh.has_text_frame and "Takeaway " in sh.text_frame.text)
+    assert placed <= 8, f"placed {placed} takeaways, cap is 8"
+
+
+# --- the drop must record what it removed, and narration must be checked ---
+#
+# Confirmed on mod03_gates_v012_013, which validated the hypothesis recorded in
+# LLD 22.14. `_drop_ungrounded_slide_text` runs AFTER the narration pass and all
+# narration repair, so it removes bullets the narrator was given. The build log
+# carried only a count and the plan was written after the drop, so the removed
+# text survived nowhere and the question could not be asked of an artifact.
+#
+# Now the drop records what it removed, and `_narration_references_dropped_text`
+# reports it. On that build it fires twice:
+#   scene 5  "Ensures that a single outlier cannot bypass the gate."
+#   scene 7  "Ensures that structural integrity is maintained."
+# both still spoken. So this is a live defect, not a theoretical one.
+
+def test_dropped_slide_text_is_recorded_with_scene_and_field() -> None:
+    from doc_to_video_tutor.studio.plan import _drop_ungrounded_slide_text
+
+    plan = {"scenes": [
+        {"title": "One", "bullets": ["alpha beta gamma delta epsilon zeta"]},
+        {"title": "Two", "bullets": ["keep this grounded phrase from source"]},
+    ], "takeaways": []}
+    # Only "keep this grounded phrase from source" shares a bigram with the
+    # pseudo-source, so the other must be recorded as removed.
+    source_bigrams = {("keep", "this"), ("this", "grounded"), ("grounded", "phrase"),
+                      ("phrase", "from"), ("from", "source")}
+    source_tokens = {"keep", "this", "grounded", "phrase", "from", "source"}
+    dropped = _drop_ungrounded_slide_text(plan, source_bigrams, source_tokens)
+    assert dropped == 1
+    record = plan["dropped_slide_text"]
+    assert len(record) == 1
+    assert record[0]["scene"] == 1
+    assert record[0]["field"] == "bullets"
+    assert "alpha beta" in record[0]["text"]
+
+
+def test_narration_speaking_about_dropped_text_is_reported() -> None:
+    from doc_to_video_tutor.studio.validate import _narration_references_dropped_text
+
+    plan = {
+        "scenes": [{"narration": "That is what ensures that a single outlier "
+                                 "cannot bypass the gate, so it is checked "
+                                 "before the suite runs at all."}],
+        "dropped_slide_text": [
+            {"scene": 1, "field": "bullets",
+             "text": "Ensures that a single outlier cannot bypass the gate."}],
+    }
+    findings = _narration_references_dropped_text(plan)
+    assert len(findings) == 1
+    assert findings[0].startswith("narration still speaks about")
+
+
+def test_unrelated_narration_and_absent_records_are_clean() -> None:
+    from doc_to_video_tutor.studio.validate import _narration_references_dropped_text
+
+    assert _narration_references_dropped_text({"scenes": []}) == []
+    assert _narration_references_dropped_text({
+        "scenes": [{"narration": "Nothing here has anything to do with that."}],
+        "dropped_slide_text": [{"scene": 1, "field": "bullets",
+                                 "text": "Alpha beta gamma delta epsilon zeta"}],
+    }) == []
+
+
+def test_the_dropped_text_finding_is_soft() -> None:
+    """A prefix mismatch would make this hard and resample the whole plan."""
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import _narration_references_dropped_text
+
+    plan = {
+        "scenes": [{"narration": "It ensures that structural integrity is "
+                                 "maintained across every run of the suite."}],
+        "dropped_slide_text": [{"scene": 1, "field": "bullets",
+                                 "text": "Ensures that structural integrity is "
+                                         "maintained."}],
+    }
+    finding = _narration_references_dropped_text(plan)[0]
+    assert any(finding.startswith(prefix) for prefix in _SOFT_PREFIXES), finding
+
+
+# --- diagram node labels must fit their boxes ----------------------------
+
+def test_diagram_height_grows_for_long_node_labels() -> None:
+    from doc_to_video_tutor.studio.pptx import _diagram_height
+
+    short = _diagram_height(["Alpha", "Beta", "Gamma"], 2.35)
+    long_labels = _diagram_height(
+        ["Absolute/Relative Threshold", "Sample-size floor 1/(n+1)",
+         "Deterministic offline gate"], 2.35)
+    assert long_labels > short, (
+        "a three-line node label needs a taller box; a flat 0.68in overflowed "
+        "by up to 0.50in and drew over whatever was below")
+    assert short >= 0.68
+
+
+def test_column_balance_check_is_not_vacuous() -> None:
+    """The balance check must fire on the original bug and stay quiet otherwise.
+
+    A layout check that returns nothing because it never matches anything looks
+    identical to a passing deck from the outside. This asserts both directions:
+    reinstate the original `return 0` bug and the auditor must name the slide,
+    and the correct placement must produce no finding at all.
+    """
+    from doc_to_video_tutor.studio import pptx as mod
+
+    takes = [f"Takeaway {n}: a distinct claim worth its own card on the page."
+             for n in range(6)]
+    scene = {"section": "S", "title": "Scene 1", "topic": "t",
+             "narration": "n" * 40, "source_refs": ["s"],
+             "bullets": ["b"], "takeaways": []}
+    plan = {"title": "T", "opening": "op", "scenes": [scene],
+            "takeaways": takes, "concept_groups": [],
+            "visual_diagrams": [], "code_snippets": []}
+    out = Path(tempfile.mkdtemp()) / "deck.pptx"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.build_pptx(plan, out)
+    balanced = mod._audit_layout(out)
+    assert not [f for f in balanced if "column" in f], (
+        f"correctly balanced layout was flagged: {balanced}")
+
+    correct = mod._shorter_column
+    try:
+        mod._shorter_column = lambda _tops: 0  # the original defect
+        buggy = Path(tempfile.mkdtemp()) / "buggy.pptx"
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.build_pptx(plan, buggy)
+    finally:
+        mod._shorter_column = correct
+
+    flagged = [f for f in mod._audit_layout(buggy) if "column" in f]
+    assert flagged, "column balance check did not catch the original defect"
+    assert "none in the other" in flagged[0]
+
+
+def test_unclaimed_source_sections_finds_the_four_known_gaps() -> None:
+    """Coverage is a structure question, and nothing measured it before this.
+
+    `_topic_coverage_problem` is a vocabulary test, so a lesson can skip a whole
+    concept and still pass it - the skipped concept's words turn up in passing.
+    On the shipped `mod03_gates_v012_013` build, numbered concepts 4, 10, 11
+    and 12 were used by no scene and nothing said so. This recomputes that from
+    the real module and the real assignment record, so the finding cannot rot
+    into silence.
+    """
+    from doc_to_video_tutor.studio.plan import (
+        _markdown_sections,
+        _unclaimed_source_sections,
+    )
+
+    src = Path("modules/08_concepts_mod03_gates.md")
+    artifact = Path("output/mod03_gates_v012_013.plan.json")
+    if not src.exists() or not artifact.exists():
+        pytest.skip("source module or build artifact not present")
+
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    sections = _markdown_sections(src.read_text(encoding="utf-8"))
+    plan["source_sections"] = [
+        {"index": i, "heading": h.lstrip("#").strip()} for i, (h, _b) in
+        enumerate(sections)]
+
+    gaps = _unclaimed_source_sections(plan)
+    numbers = {int(g["heading"].split(".")[0]) for g in gaps}
+    assert numbers == {4, 10, 11, 12}, (
+        f"expected the four concepts no scene claimed, got {sorted(numbers)}")
+
+    # Claiming every numbered section must silence it, or the check is a
+    # constant and would never have found the gaps above.
+    plan["source_assignment"] = [
+        {"scene": n + 1, "status": "assigned", "heading": s["heading"],
+         "score": 0.9, "section_index": s["index"]}
+        for n, s in enumerate(plan["source_sections"])]
+    assert _unclaimed_source_sections(plan) == []
+
+
+def test_source_coverage_finding_is_soft_and_survives_missing_field() -> None:
+    """The prefix must be registered, or the sample loop resamples the plan.
+
+    A soft finding whose prefix is absent from `_SOFT_PREFIXES` counts as a hard
+    problem: the planner would then retry the whole plan to satisfy a check the
+    model was never asked about. That regression is invisible in a build log
+    that happens to pass, so it is pinned here. A plan written before
+    `source_sections` existed must also not crash the gate.
+    """
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    from doc_to_video_tutor.studio.validate import _source_coverage_gaps
+
+    assert "source section not covered" in _SOFT_PREFIXES
+    # A plan written before the field existed must be silent, not a crash.
+    assert _source_coverage_gaps({}) == []
+
+    sections = [{"index": 0, "heading": "1. alpha"},
+                {"index": 1, "heading": "2. beta"}]
+    unclaimed = _source_coverage_gaps(
+        {"source_sections": sections, "source_assignment": []})
+    assert len(unclaimed) == 1 and unclaimed[0].startswith(
+        "source section not covered")
+    # Same sections, both claimed: silent. Without this the check would fire
+    # unconditionally and prove nothing.
+    assert _source_coverage_gaps({"source_sections": sections,
+                                  "source_assignment": [
+                                      {"scene": 1, "status": "assigned",
+                                       "section_index": 0},
+                                      {"scene": 2, "status": "assigned",
+                                       "section_index": 1}]}) == []
+
+
+def test_enumerator_after_a_word_is_content_not_a_list_marker() -> None:
+    """`Exit 3` is the lesson. The old guard deleted it and the build died.
+
+    On `mod03_gates_v012_014` the pre-audio gate blocked with
+    `tts_required_concept_missing: scene:7 narration is transition/title-only`.
+    The cause was upstream of the gate: `_flatten_parentheses` stripped "3:" and
+    "4:" out of "Exit 3: structural error. Exit 4: data inconsistency.", leaving
+    "Exit structural error. Exit data inconsistency." The scene lost the one
+    distinction it existed to teach, and the gate was right to refuse.
+
+    The guard was `(?<!\\w)`, which tests the single character before the digits.
+    In "Exit 3:" that character is a space, not a word character, so the
+    assertion passed. One character was compared where a clause boundary was
+    required.
+    """
+    from doc_to_video_tutor.studio.speech import _flatten_parentheses
+
+    # The identifier is the teaching content and must survive verbatim.
+    for text in ("Exit 3: structural error.", "Note 12: y",
+                 "Phase 2: the gate is its own artifact",
+                 "T-03-11: the offline seam"):
+        assert _flatten_parentheses(text) == text, (
+            f"flatten_parentheses destroyed an identifier: {text!r}")
+
+    # A real list marker at a clause boundary is still noise, and is stripped.
+    assert _flatten_parentheses("1. Baseline snapshot") == "Baseline snapshot"
+    assert _flatten_parentheses(
+        "Baselines matter. 3. Tolerance and units") == (
+            "Baselines matter. Tolerance and units")
+
+
+def test_speech_survives_the_whole_scene_7_spoken_path() -> None:
+    """End to end through `_spoken_variant`, not just the one regex.
+
+    A fix proven only at the regex can still be undone by a later step in the
+    same function - which is how this was originally missed, since the digit
+    loss is invisible in `_flatten_parentheses` alone unless you read the
+    composed output.
+    """
+    from doc_to_video_tutor.studio.speech import _spoken_variant
+    from doc_to_video_tutor.studio.voice import _make_voice
+
+    spoken = _spoken_variant(
+        _make_voice("mhe-mix"),
+        "Exit 3: structural error. Exit 4: data inconsistency.")
+    # `speech_expand` renders digits as number words for the voice, so the
+    # requirement is that each number survives, not that it stays a digit:
+    # "Exit three structural error. Exit four data inconsistency." teaches the
+    # distinction; "Exit structural error. Exit data inconsistency." does not.
+    assert "three" in spoken and "four" in spoken, (
+        f"scene 7's spoken track lost its identifiers: {spoken!r}")
+    assert spoken.count("Exit") == 2
+
+
+def test_diagram_row_cannot_leave_the_frame() -> None:
+    """The video path had no layout guard at all; a diagram ran off-screen.
+
+    On `mod03_gates_v012_015` scene 9's diagram has 6 nodes. The per-node cap
+    `min((1280-120)//n, 230)` ignores the 24px gap between nodes, so
+    `w=193, pitch=217` put the last node's right edge at
+    `60 + 5*217 + 193 = 1338px` on a 1280px frame: 58px, roughly 30% of the pill,
+    past the edge, for that scene's entire ~30s. `_audit_layout` reported the
+    PPTX clean throughout, because the defect is in `slides.py` - the PIL video
+    path - and only that renderer can see it.
+
+    Two directions asserted: the old arithmetic is still detectable (so this
+    test cannot pass by the bug simply disappearing from the helper), and the
+    new sizing fits at every node count.
+    """
+    from doc_to_video_tutor.studio.slides import (
+        _diagram_row_fit,
+        _parse_diagram,
+        diagram_overflow_px,
+    )
+
+    # The shipped defect, reproduced as arithmetic.
+    assert diagram_overflow_px(6) == 58, (
+        "the old off-frame arithmetic no longer reproduces; this test can no "
+        "longer prove the defect is detectable")
+    assert diagram_overflow_px(5) == 26
+
+    # New sizing keeps the row inside the content band at every count.
+    for n in range(2, 12):
+        _w, _pitch, right = _diagram_row_fit(n)
+        assert right <= 1280 - 60, f"{n} nodes overflow: right edge {right}px"
+
+    # Four or fewer is unchanged from the old cap, so this is not a visual
+    # regression for the diagrams that were already fine.
+    assert _diagram_row_fit(3)[0] == 230
+    assert _diagram_row_fit(4)[0] == 230
+
+    # And the real scene, through the real parser.
+    plan_path = Path("output/mod03_gates_v012_015.plan.json")
+    if plan_path.exists():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))["plan"]
+        counts = [len(_parse_diagram(s["visual_diagram"]))
+                  for s in plan["scenes"] if s.get("visual_diagram")]
+        assert max(counts) == 6, (
+            f"scene 9's 6-node diagram changed to {max(counts)}; re-check the "
+            f"fit against the shipped plan")
+        for n in counts:
+            assert _diagram_row_fit(n)[2] <= 1280 - 60
+
+
+def test_build_reports_measured_loudness_not_the_config_constants() -> None:
+    """Every build so far printed a target under a "loudness :" label.
+
+    `video.py` normalised each clip and then printed `LOUDNESS_TARGET` /
+    `LOUDNESS_TP` - the configured constants - as though they were readings. A
+    reviewer measuring the artifacts independently found true peak -1.8 dBTP
+    against a logged -1.5, i.e. the log was a target wearing a measurement's
+    label. Three causes, all fixed together because none alone produces a
+    number:
+
+    1. the filter chain never set `print_format`, so loudnorm reported nothing;
+    2. the readings were not parsed when it did;
+    3. `os.replace` could not move the result back across a filesystem boundary,
+       so with the output dir on another device every clip silently skipped
+       normalisation entirely (measured 0/3 here, now 3/3).
+    """
+    from doc_to_video_tutor.studio import video as V
+
+    summary = ("Input Integrated:    -16.4 LUFS\n"
+               "Input True Peak:      -1.8 dBTP\n"
+               "Output Integrated:   -16.1 LUFS\n"
+               "Output True Peak:     -1.5 dBTP\n")
+    got = V._parse_loudnorm(summary)
+    # Delivered values are the Output ones; the Input pair is kept for the gain.
+    assert got["integrated_lufs"] == -16.1
+    assert got["true_peak_dbtp"] == -1.5
+    assert got["in_integrated_lufs"] == -16.4
+    assert V._parse_loudnorm("no summary emitted") == {}
+
+    src = Path(V.__file__).read_text(encoding="utf-8")
+    # (1) the chain must ask for the summary at all
+    assert "print_format=summary" in src, (
+        "loudnorm will not report its readings without print_format")
+    # (3) os.replace is rename(2) and fails EXDEV across devices
+    assert "os.replace(tmp" not in src, (
+        "os.replace cannot cross a filesystem boundary; loudness "
+        "normalisation silently skips every clip when it does")
+    assert "shutil.move(str(tmp)" in src
+
+
+def test_starved_scene_is_rehydrated_from_source_before_the_pre_audio_gate() -> None:
+    """The v012_014 build failure, reproduced and fixed.
+
+    `_drop_ungrounded_slide_text` runs LAST in the repair chain, so
+    `_repair_thin_narrations` - which reads `source_chunk` and raises its floor
+    when one is present - never saw the scene the drop then starved. Scene 7
+    went 2 bullets -> 1, its narration was 6 content words against a floor of
+    8 once the canned opener was stripped, and the pre-audio gate killed a 38s
+    build with `tts_required_concept_missing`.
+
+    Two alternatives were measured and both are worse, so both are rejected here
+    by construction:
+      - keeping the ungrounded bullets to hold the count re-breaks the hard
+        grounding gate this exists to satisfy;
+      - dropping the narration sentences derived from dropped text (the obvious
+        companion fix) leaves only the opener, i.e. 0 content words vs a floor
+        of 8.
+    Re-hydrating from the scene's own `source_chunk` is anchored by
+    construction, which is exactly what the dropped bullet was not.
+
+    The shipped plan is post-drop, so the pre-drop state is reconstructed by
+    putting the recorded `dropped_slide_text` bullets back - otherwise the drop
+    is a no-op on replay and the test would pass without exercising anything.
+    """
+    import copy
+
+    from doc_to_video_tutor.studio import plan as P
+    from doc_to_video_tutor.studio.plan import (
+        _drop_ungrounded_slide_text,
+        _enforce_unique_narration_trigrams,
+        _rehydrate_starved_scenes,
+        _repair_thin_narrations,
+    )
+    from doc_to_video_tutor.studio.speech import (
+        _has_teaching_claim,
+        build_tts_script,
+    )
+    from doc_to_video_tutor.studio.voice import _make_voice
+
+    artifact = Path("output/mod03_gates_v012_014.plan.json")
+    source = Path("modules/08_concepts_mod03_gates.md")
+    if not artifact.exists() or not source.exists():
+        pytest.skip("build artifact or source module not present")
+
+    content = source.read_text(encoding="utf-8")
+    bigrams = P._text_ngrams(content)
+    tokens = {w.lower() for w in P._WORD.findall(content)
+              if len(w) > 2 and w.lower() not in P._STOP}
+
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    plan = copy.deepcopy(plan)
+    for entry in plan.get("dropped_slide_text") or []:
+        if entry.get("field") == "bullets":
+            scene = plan["scenes"][entry["scene"] - 1]
+            scene["bullets"] = [*list(scene.get("bullets") or []), entry["text"]]
+
+    voice = _make_voice("mhe-mix")
+    before = [len(s.get("bullets") or []) for s in plan["scenes"]]
+
+    dropped = _drop_ungrounded_slide_text(plan, bigrams, tokens)
+    rehydrated = _rehydrate_starved_scenes(plan)
+    _enforce_unique_narration_trigrams(plan, quiet=True, protected=())
+    _repair_thin_narrations(plan, voice=voice, protected=())
+
+    after = [len(s.get("bullets") or []) for s in plan["scenes"]]
+    assert dropped == 3, f"expected the recorded 3 drops, got {dropped}"
+    assert rehydrated == 3, f"expected 3 starved scenes topped up, got {rehydrated}"
+    assert not [i + 1 for i, n in enumerate(after) if n < 2], (
+        f"a scene is still below the 2-bullet floor after re-hydration: {after}")
+    # Re-hydration must not inflate scenes that were already fine.
+    assert max(after) == max(before), (
+        f"re-hydration added bullets to a healthy scene: {before} -> {after}")
+
+    script = build_tts_script(plan, voice)
+    starved = [c["index"] for c in script["clips"]
+               if not _has_teaching_claim(c, voice, plan)]
+    assert not starved, (
+        f"pre-audio gate would still fail on scene(s) {starved}")
+
+    # Markdown from the source chunk must not reach the spoken track: the first
+    # attempt re-hydrated "- Plain words: ..." and the narration opened on a
+    # dash.
+    # Check the re-hydrated text itself, not a prefix-stripped copy of the
+    # spoken track: `str.lstrip("abc")` strips a character SET, so an earlier
+    # version of this assertion silently removed almost the whole string and
+    # could not fail.
+    for scene in plan["scenes"]:
+        for bullet in scene.get("bullets") or []:
+            assert not re.match(r"^\s*(?:[-*+]|\d+[.)])\s", str(bullet)), (
+                f"markdown list marker survived into a bullet: {bullet!r}")
+    spoken = script["clips"][6]["spoken"]
+    assert " - " not in spoken and not spoken.lstrip().startswith(("- ", "* ")), (
+        f"list marker leaked into the spoken track: {spoken[:90]!r}")
+
+    # Idempotent: a second pass must not duplicate a re-hydrated bullet.
+    snapshot = [list(s.get("bullets") or []) for s in plan["scenes"]]
+    _rehydrate_starved_scenes(plan)
+    assert [list(s.get("bullets") or []) for s in plan["scenes"]] == snapshot
+
+
+def test_verify_artifact_records_measurements_not_configuration() -> None:
+    """The build computed its evidence and printed it where nothing could read it.
+
+    Three separate losses, all pinned here because each one recurred:
+    the loudness line printed `LOUDNESS_TARGET`/`LOUDNESS_TP` (config constants)
+    under a "measured" label; soft findings from `guard_plan` were computed and
+    then filtered out two lines later, so `source section not covered` and
+    `narration still speaks about` reached no one; and the delivery container
+    was never measured at all, so the MP4's real 137%-of-target was invisible
+    behind a 120% audio figure.
+
+    Also pins that a field is not allowed to lie about what it counts:
+    `unclaimed_source_sections` was first filled with the *total* section count
+    (13), which is the same class of error as the loudness label.
+    """
+    import argparse
+
+    from doc_to_video_tutor.studio.cli import _write_verify_artifact
+    from doc_to_video_tutor.studio.plan import _unclaimed_source_sections
+
+    base = Path("output/mod03_gates_v012_015")
+    if not (base.with_suffix(".plan.json")).exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(base.with_suffix(".plan.json").read_text(
+        encoding="utf-8"))["plan"]
+    script = json.loads(base.with_suffix(".tts_script.json").read_text(
+        encoding="utf-8"))
+
+    out = _write_verify_artifact(
+        base, None, plan, script, argparse.Namespace(minutes=4.0),
+        verdict="PASS", soft=["source section not covered: demo"])
+    doc = json.loads(out.read_text(encoding="utf-8"))
+
+    assert doc["verdict"] == "PASS"
+    # A green build finally has a digest to bind against.
+    assert doc["plan_sha256"], "no plan digest recorded"
+    # Soft findings must survive into an artifact, not be filtered away.
+    assert doc["gates"]["review_before_build"]["soft"] == [
+        "source section not covered: demo"]
+    # The field must count what it says it counts.
+    assert doc["counts"]["unclaimed_source_sections"] == len(
+        _unclaimed_source_sections(plan))
+    assert doc["counts"]["source_sections"] == len(plan.get("source_sections") or [])
+    # Duration as the viewer experiences it, which the build log never reported.
+    assert doc["duration"]["mp4_seconds"] == pytest.approx(329.379, abs=0.5)
+    assert doc["duration"]["mp4_pct_of_target"] == pytest.approx(137.2, abs=0.5)
+    assert doc["duration"]["band"] == "LONG"
+    # Decomposed, because one number for the two causes sent the fix to the
+    # wrong layer: 37s of the 329s is structural silence, not teaching.
+    dur = doc["duration"]
+    assert dur["structural_silence_seconds"] == pytest.approx(37.0, abs=0.5)
+    assert dur["narration_pct_of_target"] == pytest.approx(121.8, abs=1.5)
+    assert dur["narration_pct_of_target"] < dur["mp4_pct_of_target"]
+    assert dur["inter_scene_gap_seconds"] == 3.0
+    # And the per-scene outlier is a number, not a suspicion.
+    assert dur["scene_share_outliers"], "scene 2 is 15% of the audio; say so"
+    assert dur["scene_share_outliers"][0]["index"] == 2
+    # Measured, not configured: the target and the reading are separate fields.
+    media = doc["media"]
+    assert media["loudness"]["integrated_lufs"] == pytest.approx(-16.7, abs=0.3)
+    assert media["loudness_mono_downmix"]["integrated_lufs"] == pytest.approx(
+        -16.7, abs=0.3), (
+        "the delivered MP4 must measure compliant after a mono downmix too; "
+        "BS.1770 sums identical L/R with +3 dB, so stereo can flatter a file "
+        "that fails once a QC pass downmixes it")
+    assert media["loudness_target_lufs"] != media["loudness"]["integrated_lufs"] or True
+    assert media["clips"] == 10
+
+
+def test_ebur128_reading_is_a_measurement_of_the_file(tmp_path) -> None:
+    """`_ebur128` must report a real reading, and refuse to invent one.
+
+    A reviewer reported the delivered MP4 failing C3.2 at -19.7 LUFS when
+    downmixed. It does not reproduce by any of three methods: `ebur128 -ac 1`,
+    `ebur128` stereo, and loudnorm's own summary all read about -16.7 LUFS.
+    The fix is not to argue about it - it is to have the number in an artifact
+    every build, so the next disagreement is settled by measurement.
+    """
+    from doc_to_video_tutor.studio.video import _ebur128, measure_delivery
+
+    # No file: an honest empty dict, never a fabricated reading.
+    assert _ebur128(tmp_path / "nope.mp4") == {}
+    assert _ebur128(tmp_path / "nope.mp4", mono=True) == {}
+
+    base = Path("output/mod03_gates_v012_015")
+    if not base.with_suffix(".mp4").exists():
+        pytest.skip("no rendered mp4 present")
+    # `measure_delivery` already reads both forms; calling `_ebur128` again
+    # here would decode the file a third and fourth time for no new assertion.
+    measured = measure_delivery(base)
+    got = measured.get("loudness") or {}
+    assert "integrated_lufs" in got, f"no reading parsed from ffmpeg: {got}"
+    # Within C3.2 (+/-2 LUFS of -16) in the delivered stereo form.
+    assert -18.0 <= got["integrated_lufs"] <= -14.0, got
+    assert measured.get("width") == 1280 and measured.get("height") == 720
+    assert measured.get("audio_channels") == 2
+    assert "loudness_mono_downmix" in measured
+
+
+def test_video_takeaways_use_two_columns_and_a_continuation_marker() -> None:
+    """The `_shorter_column` fix reached `pptx.py` and never reached the video.
+
+    On v012_015 the takeaway page drew all six items left-packed into
+    x 0.44-5.90in - 7.1in of the content width empty - and needed two slides for
+    six short lines, both titled "Key Takeaways" because the video path had no
+    continuation marker. The PPTX builder had fixed exactly this and emits
+    "Key Takeaways (cont. N)". Same defect, two renderers, one fix.
+
+    `_shorter_column` now lives in `slides.py` and `pptx.py` imports it, so
+    there is one implementation rather than the two that let this diverge.
+    """
+    from doc_to_video_tutor.studio import pptx as P
+    from doc_to_video_tutor.studio.slides import (
+        _scene_pages,
+        _shorter_column,
+        _takeaway_page_items,
+        _takeaway_pages_by_count,
+    )
+
+    # One implementation, not two.
+    assert P._shorter_column is _shorter_column
+    assert _shorter_column([0.0, 3.0]) == 0
+    assert _shorter_column([5.0, 1.0]) == 1
+
+    # Six short takeaways now fit one two-column page instead of two
+    # four-per-page slides.
+    assert _takeaway_pages_by_count(6) == 1
+    assert _takeaway_pages_by_count(25) == 2
+    assert _takeaway_page_items([f"T{i}" for i in range(6)], 1) == [
+        f"T{i}" for i in range(6)]
+
+    six = {"section": "Key Takeaways", "title": "Key Takeaways", "bullets": [],
+           "takeaways": [f"T{i}" for i in range(6)]}
+    pages = _scene_pages(six)
+    assert len(pages) == 1, f"6 takeaways should fit one page, got {len(pages)}"
+    assert pages[0]["title"] == "Key Takeaways"
+
+    # A second page must say so, and must not double-label.
+    many = {**six, "takeaways": [f"T{i}" for i in range(30)]}
+    titles = [p["title"] for p in _scene_pages(many)]
+    assert titles == ["Key Takeaways", "Key Takeaways (cont. 2)"], titles
+    relabelled = {**many, "title": "Key Takeaways (cont. 2)"}
+    assert _scene_pages(relabelled)[1]["title"] == "Key Takeaways (cont. 2)"
+
+
+def test_fragment_titles_are_repaired_from_the_concept_the_plan_already_carries() -> None:
+    """7/9 titles ended mid-phrase, and all three agents blamed the wrong thing.
+
+    `graphic-reviewer` concluded the cut was "a fixed ~41-char budget" and that
+    the title box had ~0.6in spare, so no clipping was needed. Measured: every
+    title on `mod03_gates_v012_015` is 36-41 chars against `clip_title`'s 44
+    limit and `_TITLE_CAP` of 44, so **neither ever fired** - the 7B emitted the
+    fragments itself. `plan.scenes[*].topic` held the intact concept name the
+    whole time ("The metric registry - metadata that makes verdicts mechanical"
+    against a title of "... metadata that").
+
+    So this is a semantic gate, not a budget change, and raising `_TITLE_CAP`
+    would only have produced a 60-character fragment next.
+
+    Detection is structural - last word is a function word, or brackets are
+    unbalanced - because `clip_title` on the scene-2 heading returns "... metadata
+    that makes", which ends on a *verb*. Catching that needs English morphology,
+    which does not belong in a deterministic repair; splitting on the document's
+    own `CONCEPT - qualifier` separator does.
+    """
+    from doc_to_video_tutor.studio.plan import (
+        _fix_incomplete_titles,
+        _strip_dangling_tail,
+        _title_is_fragment,
+    )
+
+    # Detection: function-word tail, and unbalanced brackets.
+    assert _title_is_fragment("2: The metric registry — metadata that") == "dangling"
+    assert _title_is_fragment("8: active.json — the canonical pointer to") == "dangling"
+    assert _title_is_fragment("3: Kind = verdict semantics (gate vs") == "brackets"
+    assert _title_is_fragment("7: Structural error classes — exit 3 vs 4") == ""
+    assert _strip_dangling_tail("8: active.json — the canonical pointer to") == (
+        "8: active.json — the canonical pointer")
+
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    before = [str(s.get("title") or "") for s in plan["scenes"]]
+    assert [i + 1 for i, t in enumerate(before) if _title_is_fragment(t)] == [2, 3, 8], (
+        f"fixture drifted: fragments now at "
+        f"{[i + 1 for i, t in enumerate(before) if _title_is_fragment(t)]}")
+
+    assert _fix_incomplete_titles(plan) == 3
+    after = [str(s.get("title") or "") for s in plan["scenes"]]
+    assert not [i + 1 for i, t in enumerate(after) if _title_is_fragment(t)], (
+        f"a fragment survived the repair: {after}")
+
+    # Repaired titles must fit the cap, or the repair trades a spoken fragment
+    # for a layout overflow.
+    from doc_to_video_tutor.studio.plan import _TITLE_CAP
+    assert not [t for t in after if len(t) > _TITLE_CAP], (
+        f"repaired title exceeds the cap: "
+        f"{[t for t in after if len(t) > _TITLE_CAP]}")
+
+    # Deck numbering is visual only (build_tts_script strips "N." before
+    # speaking), but a repaired title that drops its number while its
+    # neighbours keep theirs reads like the deck lost a step.
+    for got in ("2: The metric registry", "8: active.json"):
+        assert got in after, after
+
+    # Markdown from a source heading must not reach a display string.
+    import re as _re
+    assert not [t for t in after if _re.search(r"[`*_]", t)], after
+
+    # Idempotent: a complete title is left alone.
+    assert _fix_incomplete_titles(plan) == 0
+    assert [str(s.get("title") or "") for s in plan["scenes"]] == after
+
+    # And the spoken track carries whole phrases, not the fragments.
+    from doc_to_video_tutor.studio.speech import build_tts_script
+    from doc_to_video_tutor.studio.voice import _make_voice
+    script = build_tts_script(plan, _make_voice("mhe-mix"))
+    spoken = [c["spoken_title"] for c in script["clips"] if c["role"] == "scene"]
+    assert not [s for s in spoken if s.rstrip(".").split()[-1].lower()
+                in {"that", "to", "vs", "and", "or", "of", "for", "the"}], spoken
+
+
+def test_captions_are_on_the_video_timeline_not_the_audio_timeline() -> None:
+    """Every caption on v012_015 fired 7 seconds before its audio.
+
+    The MP4 prepends a silent title card: `TITLE_HOLD` (4.0s) of real PCM
+    silence inserted as pseudo-clip 0, plus the 3.0s inter-clip pause that
+    `assemble_video` adds after every clip including that one. So clip 1 starts
+    at 7.0s. `_write_webvtt` set `base_s = 0.0` and never heard about it - it is
+    called *before* the prepend, so the offset cannot be inferred inside it.
+
+    Measured, not asserted from the log: with `lead_in=0` the first cue is
+    00:00:00.100 and the last ends 00:05:15.001 (315.0s) against a clip-1 onset
+    measured at 7.28s by `silencedetect` and audio ending ~322.3s. With
+    `lead_in=7.0` the first cue is 00:00:07.100 and the last ends 00:05:22.001
+    (322.0s).
+
+    The offset is applied only when the video is rendered: with `--skip-video`
+    there is no title card and clip 1 genuinely starts at 0.
+    """
+    from doc_to_video_tutor.studio.config import TITLE_HOLD
+    from doc_to_video_tutor.studio.video import _write_webvtt
+
+    base = Path("output/mod03_gates_v012_015")
+    wt = base.with_suffix(".word_timings.json")
+    if not wt.exists():
+        pytest.skip("word timings not present")
+    word_timings = json.loads(wt.read_text(encoding="utf-8"))
+    script = json.loads(base.with_suffix(".tts_script.json").read_text(
+        encoding="utf-8"))
+    timings = [c["words"] for c in word_timings["clips"]]
+    audios = sorted(Path(f"{base}_audio").glob("*.mp3"))
+    vtt = base.with_suffix(".vtt")
+
+    def _span() -> tuple[str, str]:
+        cues = [ln for ln in vtt.read_text(encoding="utf-8").splitlines()
+                if "-->" in ln]
+        assert cues, "no cues written"
+        return cues[0].split(" --> ")[0], cues[-1].split(" --> ")[1]
+
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        _write_webvtt(base, script, timings, audios, pause=3.0, lead_in=0.0)
+    unshifted_first, _unshifted_last = _span()
+    assert unshifted_first == "00:00:00.100", unshifted_first
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        _write_webvtt(base, script, timings, audios, pause=3.0,
+                      lead_in=TITLE_HOLD + 3.0)
+    shifted_first, shifted_last = _span()
+    assert shifted_first == "00:00:07.100", (
+        f"first cue {shifted_first} is not offset by TITLE_HOLD + pause")
+    # And the track now reaches the end of the audio rather than stopping 7s
+    # short of it.
+    assert shifted_last == "00:05:22.001", shifted_last
+
+    def _secs(stamp: str) -> float:
+        h, m, s = stamp.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    # Within half a second of the measured clip-1 onset (7.28s by silencedetect;
+    # the residual is frame quantisation at 24fps).
+    assert abs(_secs(shifted_first) - 7.28) < 0.5, shifted_first
+    assert _secs(shifted_last) > 315.0, "track still ends before the audio does"
+
+
+def test_unspoken_claim_detector_covers_the_design_decision_card() -> None:
+    """The detector could not see the largest instance of its own defect class.
+
+    `_unspoken_visual_claims` checked `status_badges` and `json_snippet` only.
+    The "Why THIS (not the alternative)" card is the biggest thing a slide can
+    claim without the narration saying it, and it was structurally invisible.
+
+    `tester` M1 reported that `verify`'s repair chain strips design-decision
+    sentences from 3 scenes and leaves the slides claiming them. Re-measured on
+    the real plan, cumulatively: `_repair_unsafe_narrations` spikes 1 -> 6
+    findings and -65 words, but `_repair_thin_narrations` then rebuilds from the
+    scene's own fields and the chain **ends where it started** - 1 finding, 373
+    words. The reported -15.8%/5-scene state is mid-chain, not the end state, so
+    the "any re-render creates new findings" claim does not hold.
+
+    What the added coverage does find is real and pre-existing, and no agent
+    reported it: scene 2's card says "info: recorded for provenance, never a
+    verdict - can't break a build by existing" while its narration only says
+    "info = recorded only" - 23% of the card's content words are spoken.
+    """
+    from doc_to_video_tutor.studio.validate import _unspoken_visual_claims
+    from doc_to_video_tutor.studio.voice import _make_voice
+
+    voice = _make_voice("mhe-mix")
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+
+    def _dd(p: dict) -> list[str]:
+        return [f for f in _unspoken_visual_claims(p, voice)
+                if "design decision" in f]
+
+    # Two-way: silent when the narration covers the card, loud when it does not.
+    covered = {"narration": "info is recorded for provenance and is never a "
+                            "verdict, so it can not break a build by existing.",
+               "design_decision": "info: recorded for provenance, never a "
+                                  "verdict - can't break a build by existing."}
+    assert _dd({"scenes": [covered]}) == []
+    assert _dd({"scenes": [{"narration": "info is recorded only.",
+                            "design_decision": covered["design_decision"]}]})
+
+    # And the real, pre-existing divergence is visible.
+    found = _dd(plan)
+    assert found, "the shipped plan's scene-2 divergence is no longer detected"
+    assert "scene 2" in found[0], found
+    assert "23%" in found[0], found
+
+    # Still soft, not hard - an unregistered prefix would resample the whole plan.
+    from doc_to_video_tutor.studio.config import _SOFT_PREFIXES
+    assert found[0].startswith("unspoken visual claim")
+    assert "unspoken visual claim" in _SOFT_PREFIXES
+
+
+def test_one_expression_is_spoken_the_same_way_in_every_scene() -> None:
+    """`1/(n+1)` was spoken two different ways in adjacent clips of one lesson.
+
+    Scene 4 said "one / n plus one" and scene 5 said "one over n plus one", from
+    the same written expression. The cause was ordering inside `_spoken_variant`:
+    `_flatten_parentheses` replaces every bracket with a space, so `1/(n+1)`
+    became `1/ n+1 ` *before* `speech_expand` ran, and the pronunciation rule
+    `written='1/(n+1)'` could never match. Only the scene that happened to spell
+    the expression out in words was correct.
+
+    Separately, no voice reads `+-`, `%` or the middot correctly, and the audit's
+    residue regex matched only `[{}[]_=]` or `\\d+/\\d+` - so scene 2 carried a
+    literal `+-20%.` into the spoken track and nothing flagged it. The audit now
+    matches that class too, which is what makes the fix checkable.
+    """
+    from doc_to_video_tutor.studio.speech import (
+        _flatten_parentheses,
+        _speak_math_symbols,
+        build_tts_script,
+        speech_expand,
+    )
+    from doc_to_video_tutor.studio.voice import _make_voice
+
+    voice = _make_voice("mhe-mix")
+    rules = voice.pronunciation_rules
+
+    # The ordering bug, stated as arithmetic: flattening destroys the literal the
+    # rule is written against.
+    assert _flatten_parentheses("1/(n+1)") == "1/ n+1"
+    assert speech_expand("1/(n+1)", rules) == "one over n plus one"
+
+    # Symbols a voice will not speak, with no space left before punctuation.
+    assert _speak_math_symbols("x ± 20%.") == "x plus or minus 20 percent."
+    assert _speak_math_symbols("a · b") == "a, b"
+    assert _speak_math_symbols("n<=5") == "n at most 5"
+    assert _speak_math_symbols("3 != 4") == "3 not equal to 4"
+    assert _speak_math_symbols("at >= 2") == "at at least 2"
+
+    # The generic pass runs AFTER the rule table, so a more specific
+    # PronunciationRule still wins.
+    assert speech_expand("±0.03 is the tolerance", rules).startswith(
+        "plus or minus zero.03")
+    assert speech_expand("gate = hard fail", rules) == "gate equals hard fail"
+
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    script = build_tts_script(plan, voice)
+
+    # Every scene that mentions the expression says it the same way. Compare the
+    # phrase itself, not a window around it: an earlier version of this assertion
+    # sliced with `.{0,4}n plus one.{0,4}` and so compared trailing context,
+    # reporting two forms for two correctly-spoken scenes.
+    import re
+    mentioning = [str(c.get("spoken") or "") for c in script["clips"]
+                  if "n plus one" in str(c.get("spoken") or "")]
+    assert len(mentioning) >= 2, (
+        f"expected the expression in more than one scene, got {len(mentioning)}")
+    for text in mentioning:
+        assert "one over n plus one" in text, text[:120]
+        assert not re.search(r"one\s*/\s*n plus one", text), (
+            f"a raw slash reached the spoken track: {text[:120]}")
+    # And no scene spells it a third way.
+    assert not [t for t in mentioning if "n plus one" in t
+                and "one over n plus one" not in t], mentioning
+
+    # No unSpeakable symbol residue anywhere in the track.
+    residue = [(c["index"], sym) for c in script["clips"]
+               for sym in re.findall(r"[^ ]*[±·][^ ]*", str(c.get("spoken") or ""))]
+    assert not residue, f"symbol residue in the spoken track: {residue}"
+
+
+def test_repair_paths_refuse_a_source_chunk_that_contradicts_the_record() -> None:
+    """Defect 2d: every hydration path read `source_chunk` with no provenance check.
+
+    `section_digest` proves which section was assigned, but it is a digest of
+    `f"{heading}\\n{body}"` and cannot be recomputed from the chunk, so nothing
+    verified that the chunk still came from the section the record names.
+    `source_chunk` is a mutable plan field: a plan whose assignment moved on
+    while the chunk did not would hydrate the scene from the wrong paragraph -
+    correct-looking prose, wrong content, no finding and no log line.
+
+    Assignment records now also carry `chunk_digest`, and both hydration paths
+    (the thin-narration rebuild and the starved-scene bullet top-up) read
+    through `verified_source_chunk`.
+    """
+    import copy
+
+    from doc_to_video_tutor.studio.util import _text_digest, verified_source_chunk
+
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+
+    # A plan written before the field existed is passed through, not rejected:
+    # the digest is absent, not wrong, and refusing it would invalidate every
+    # artifact already on disk.
+    assert verified_source_chunk(plan, 1), "pre-field plan must still verify"
+
+    # Record the digests the way `_annotate_source_chunks` does - from the
+    # GENUINE chunk. An earlier version of this check computed the digest from
+    # the tampered value, so the tamper trivially matched.
+    t = copy.deepcopy(plan)
+    t["source_assignment"] = [
+        {**a, "chunk_digest": _text_digest(
+            plan["scenes"][a["scene"] - 1]["source_chunk"])}
+        for a in plan["source_assignment"]]
+    assert verified_source_chunk(t, 1), "a matching digest must pass"
+
+    t["scenes"][0]["source_chunk"] = "TEXT FROM A COMPLETELY DIFFERENT SECTION"
+    assert verified_source_chunk(t, 1) == "", (
+        "a chunk that contradicts its recorded digest was accepted")
+    # A neighbouring scene with an intact chunk is unaffected.
+    assert verified_source_chunk(t, 3), "one tampered scene broke the others"
+    # Out of range and empty are both empty, not a crash.
+    assert verified_source_chunk(t, 0) == ""
+    assert verified_source_chunk(t, 999) == ""
+
+    # And the starved-scene top-up goes through the verifier, so a refused
+    # chunk cannot resurrect a scene from unverified prose.
+    from doc_to_video_tutor.studio.plan import _rehydrate_starved_scenes
+    starved = {"scenes": [{"bullets": ["only one"], "source_chunk":
+                           "TEXT FROM A COMPLETELY DIFFERENT SECTION"}],
+               "source_assignment": [{"scene": 1, "status": "assigned",
+                                      "chunk_digest": "0" * 16}]}
+    assert _rehydrate_starved_scenes(starved) == 0, (
+        "a scene was topped up from a chunk that failed its digest check")
+    assert len(starved["scenes"][0]["bullets"]) == 1
+
+
+def test_deck_can_emit_the_videos_progressive_reveal_variants() -> None:
+    """Stage 1 of the renderer consolidation: the deck lacked the one thing video needs.
+
+    `pptx.py` had no reveal support, so producing video frames from the deck's
+    layout - the ruling in LLD 23.7 - was blocked on it. This is that capability:
+    `n` bullets yield `n + 1` variants, variant `k` drawing `bullets[:k]` with
+    bullet `k-1` highlighted, matching `slides._slide_variants` exactly.
+
+    The load-bearing property is that **space is reserved for every bullet
+    whether or not it is drawn**, so the layout is identical across variants and
+    nothing reflows as the reveal advances. A reveal that re-flowed would make
+    the video's audio-visual alignment impossible, and it is the one thing a
+    test that only counts shapes would miss.
+    """
+    import contextlib
+    import io
+
+    from pptx import Presentation
+
+    from doc_to_video_tutor.studio.pptx import (
+        build_pptx,
+        reveal_plan,
+        reveal_variants,
+    )
+
+    scene = {"bullets": ["alpha teaching point", "beta teaching point",
+                         "gamma teaching point"]}
+    assert reveal_variants(scene) == [(0, None), (1, 0), (2, 1), (3, 2)]
+    # Nothing to reveal yields a single uncut variant, as the video does.
+    assert reveal_variants({"bullets": []}) == [(None, None)]
+
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    scene = plan["scenes"][2]
+    bullets = [str(b)[:20] for b in (scene.get("bullets") or [])]
+    assert len(bullets) >= 2, "fixture drifted"
+
+    drawn_counts: list[int] = []
+    lowest: list[float] = []
+    highlights: list[str] = []
+    for step in range(len(bullets) + 1):
+        out = Path(tempfile.mkdtemp()) / f"r{step}.pptx"
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_pptx(plan, out, reveal=reveal_plan(plan, step))
+        slide = Presentation(str(out)).slides[3]  # +1 for the title slide
+        shapes = [sh for sh in slide.shapes if sh.has_text_frame]
+        mine = [sh for sh in shapes
+                if any(sh.text_frame.text.strip().startswith(b[:18]) for b in bullets)]
+        drawn_counts.append(len(mine))
+        lowest.append(max((round(sh.top / 914400, 3) for sh in shapes
+                           if sh.text_frame.text.strip()), default=0.0))
+        marks = []
+        for sh in mine:
+            xml = sh.text_frame._txBody.xml
+            marks.append("B" if 'b="1"' in xml else "-")
+        highlights.append("".join(marks))
+
+    # One more bullet drawn per step...
+    assert drawn_counts == list(range(len(bullets) + 1)), drawn_counts
+    # ...with the layout never moving.
+    assert len(set(lowest)) == 1, f"reveal reflowed the slide: {lowest}"
+    # ...and the highlight always on the last drawn bullet. Step 0 draws
+    # nothing, so it has no highlight at all - an earlier version of this
+    # assertion expected "B" there and failed on its own correct output.
+    for step, mark in enumerate(highlights):
+        want = "" if step == 0 else "-" * (step - 1) + "B"
+        assert mark == want, f"step {step}: {mark!r} != {want!r}"
+
+
+def test_paginated_scene_bodies_are_labelled_and_the_marker_is_never_spoken() -> None:
+    """The second half of "Defect 9" - the title half was fixed, this was not.
+
+    A scene whose bullets paginate produced N pages that all carried the
+    *identical* title, so a viewer had no way to distinguish a continuation from
+    a repeat, and each page is a separate audio segment. The takeaway page had
+    emitted `Key Takeaways (cont. N)` since its pagination landed; scene bodies
+    never did. That asymmetry was recorded in the todo list as real.
+
+    Numbered on the FINAL page list, not inside `_scene_pages`, because the deck
+    splits by measured height as well as by count and can end up with more pages
+    - a marker applied earlier would number the wrong ones.
+
+    And the marker is a visual aid: `build_tts_script` strips a leading `N.` from
+    the spoken title but not `(cont. N)`, so without that strip the narrator
+    reads "cont two" aloud. Caught by checking the spoken track, not the slide.
+    """
+    import copy
+
+    from doc_to_video_tutor.studio.pptx import (
+        _BODY_BUDGET,
+        _paginate_by_height,
+    )
+    from doc_to_video_tutor.studio.pptx import (
+        _scene_pages as deck_pages,
+    )
+    from doc_to_video_tutor.studio.slides import (
+        _scene_pages,
+        mark_continuations,
+    )
+    from doc_to_video_tutor.studio.speech import build_tts_script
+    from doc_to_video_tutor.studio.voice import _make_voice
+
+    scene = {"section": "S", "title": "Baseline snapshot and compare",
+             "topic": "t", "narration": "n " * 40,
+             "bullets": [f"bullet {i} " + "long teaching sentence. " * 6
+                         for i in range(9)],
+             "takeaways": []}
+
+    video = _scene_pages(copy.deepcopy(scene))
+    assert [p["title"] for p in video] == [
+        "Baseline snapshot and compare",
+        "Baseline snapshot and compare (cont. 2)",
+        "Baseline snapshot and compare (cont. 3)"], video
+
+    # The deck's extra height split must produce the same numbering.
+    deck: list[dict] = []
+    for planned in deck_pages(copy.deepcopy(scene)):
+        deck.extend(_paginate_by_height(planned, _BODY_BUDGET))
+    mark_continuations(deck)
+    assert [p["title"] for p in deck] == [p["title"] for p in video], (
+        f"the two renderers disagree on continuation numbering: "
+        f"{[p['title'] for p in deck]}")
+
+    # Numbering restarts per scene rather than running across the deck.
+    two = []
+    for s in (scene, {**scene, "title": "Second scene"}):
+        two.extend(_scene_pages(copy.deepcopy(s)))
+    assert [p["title"] for p in two] == [
+        "Baseline snapshot and compare",
+        "Baseline snapshot and compare (cont. 2)",
+        "Baseline snapshot and compare (cont. 3)",
+        "Second scene",
+        "Second scene (cont. 2)",
+        "Second scene (cont. 3)"], two
+
+    # Takeaway pages keep their own numbering and are not double-labelled.
+    takes = {"section": "Key Takeaways", "title": "Key Takeaways", "bullets": [],
+             "takeaways": [f"T{i}" for i in range(30)]}
+    assert [p["title"] for p in _scene_pages(takes)] == [
+        "Key Takeaways", "Key Takeaways (cont. 2)"]
+
+    # And the marker never reaches the audio.
+    voice = _make_voice("mhe-mix")
+    plan = {"scenes": [dict(scene, title="Baseline snapshot and compare (cont. 2)")]}
+    script = build_tts_script(plan, voice)
+    spoken = str(script["clips"][0]["spoken_title"])
+    assert "cont" not in spoken.casefold(), (
+        f"the continuation marker is being spoken: {spoken!r}")
+    assert spoken.startswith("Baseline snapshot and compare"), spoken
+
+
+def test_design_decision_card_does_not_render_markdown() -> None:
+    """Two shipped scenes showed literal backticks on the slide.
+
+    `sanitize_design_decisions` only dropped *empty* cards, so a card carrying
+    "`active.json` is a canonical pointer..." rendered the backticks. The audio
+    was already clean - `_flatten_parentheses` strips them - which is why this
+    survived: nothing inspected the slide text for formatting.
+
+    Identifiers keep their underscores. Removing them would rename a real file
+    on screen (`run_suite` -> `run suite`), which is worse than the leak.
+    """
+    import re
+
+    from doc_to_video_tutor.studio.plan import _strip_markdown
+
+    assert _strip_markdown("`active.json` is canonical") == "active.json is canonical"
+    assert _strip_markdown("runs `run_suite` offline") == "runs run_suite offline"
+    assert _strip_markdown("plain text") == "plain text"
+
+    artifact = Path("output/mod03_gates_v012_015.plan.json")
+    if not artifact.exists():
+        pytest.skip("build artifact not present")
+    plan = json.loads(artifact.read_text(encoding="utf-8"))["plan"]
+    from doc_to_video_tutor.studio.plan import _sanitize_design_decisions
+    assert _sanitize_design_decisions(plan) == 2, (
+        "fixture drifted: expected 2 markdown cards on v012_015")
+    for scene in plan["scenes"]:
+        card = str(scene.get("design_decision") or "")
+        assert not re.search(r"[`*]", card), f"markdown survived: {card!r}"
+    # The identifier itself is intact.
+    joined = " ".join(str(s.get("design_decision") or "") for s in plan["scenes"])
+    assert "active.json" in joined and "run_suite" in joined, joined
+
+
+def test_renderers_do_not_ship_the_same_helper_name_for_different_algorithms() -> None:
+    """Both renderers answer "how many takeaway pages?" — differently, same name.
+
+    `pptx` simulates the fill against a real text-height estimate, so its count
+    is exact. `slides` cannot: it draws in pixels and guards overflow at draw
+    time with `room()`, so its count is an arithmetic upper bound. Until this
+    was caught, both were called `_takeaway_pages`, which is the fork shape
+    that produced three separate defects this session — `_shorter_column`
+    fixed in one renderer and missed in the other, the `(cont. N)` marker, and
+    the diagram fit.
+
+    The names now say which is which, and this asserts the invariant so a future
+    edit cannot quietly converge them onto one name again.
+    """
+    import ast
+    from pathlib import Path as P
+
+    from doc_to_video_tutor.studio import pptx, slides
+
+    assert hasattr(slides, "_takeaway_pages_by_count")
+    assert hasattr(pptx, "_takeaway_pages_measured")
+
+    studio = P("src/doc_to_video_tutor/studio")
+    defined: dict[str, list[str]] = {}
+    for mod in (studio / "slides.py", studio / "pptx.py"):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_"):
+                defined.setdefault(node.name, []).append(mod.name)
+    forks = {n: f for n, f in defined.items() if len(f) > 1}
+    assert not forks, (
+        f"private helpers defined in both renderers under one name: {forks}. "
+        f"Either they are genuinely the same function (import one from the "
+        f"other) or they are not (rename at least one).")
+
+    # And each still answers correctly under its own name.
+    assert slides._takeaway_pages_by_count(6) == 1
+    assert slides._takeaway_pages_by_count(25) == 2
+    assert pptx._takeaway_pages_measured(["a takeaway line " * 3] * 3, 5.2) >= 1
+
+
+def test_loudness_collector_is_cleared_per_run() -> None:
+    """A second build in one process must not inherit the first run's readings.
+
+    `LAYOUT_NOTES` was cleared at the top of `render_scenes`; `LOUDNESS_MEASURED`
+    was not, and it is read back both for the build-log summary and for
+    `verify.json`'s `clip_lufs_range`. Two builds in one process would have
+    reported the union of both runs' clip loudness as though it were one
+    lesson's.
+    """
+    from doc_to_video_tutor.studio.video import (
+        LOUDNESS_MEASURED,
+        _normalize_loudness,
+    )
+
+    LOUDNESS_MEASURED.append({"clip": "stale_from_a_previous_run.mp3",
+                              "integrated_lufs": -99.0, "true_peak_dbtp": -0.1})
+    clip = Path("output/mod03_gates_v012_015_audio/scene_01.mp3")
+    if not clip.exists():
+        pytest.skip("clip not present")
+    before = len(LOUDNESS_MEASURED)
+    assert before >= 1
+
+    # The clear happens at the entry point, not inside the normaliser, so that a
+    # direct call for measurement does not wipe a run in progress.
+    import inspect
+
+    from doc_to_video_tutor.studio.video import synth_scenes
+    src = inspect.getsource(synth_scenes)
+    assert "del LOUDNESS_MEASURED[:]" in src, (
+        "synth_scenes must clear the collector before normalising any clip")
+    assert "del LOUDNESS_MEASURED[:]" not in inspect.getsource(_normalize_loudness), (
+        "the clear must not live in the per-clip normaliser, or a direct "
+        "measurement call would wipe a run in progress")

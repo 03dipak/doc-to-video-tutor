@@ -70,6 +70,7 @@ from .topics import (
     _plan_is_on_topic,
     _topic_coverage_problem,
 )
+from .util import _text_digest, verified_source_chunk
 from .voice import _MHE_VOICE, NarrationVoice, _assign_closers, _assign_openers
 
 _MAX_PATCH_SCENES = 4
@@ -107,6 +108,18 @@ def _harvest_takeaways(plan: dict) -> int:
     if got:
         plan["takeaways"] = got[:8]
     return len(got)
+def _strip_markdown(text: str) -> str:
+    """Display text with markdown emphasis removed.
+
+    Backticks, asterisks and underscores are authoring markers; a slide or a
+    card shows them literally. Underscores are left alone inside identifiers
+    (`run_suite`, `active.json`) because removing them would rename a real file
+    on screen.
+    """
+    value = re.sub(r"[`*]", "", str(text or ""))
+    return " ".join(value.split())
+
+
 def _sanitize_design_decisions(plan: dict) -> int:
     """Empty degenerate 'design_decision' fields in place; return count removed.
 
@@ -117,6 +130,7 @@ def _sanitize_design_decisions(plan: dict) -> int:
     """
     dds = [str(s.get("design_decision", "")) for s in plan["scenes"]]
     removed = 0
+    stripped = 0
     for i, dd in enumerate(dds):
         low, toks = dd.lower(), set(_tokens_of(dd))
         degenerate = (
@@ -129,7 +143,18 @@ def _sanitize_design_decisions(plan: dict) -> int:
         if degenerate and dd.strip():
             plan["scenes"][i]["design_decision"] = ""
             removed += 1
-    return removed
+            continue
+        # The card is displayed, so it must not carry markdown. Two shipped
+        # scenes had it: "`active.json` is a canonical pointer..." rendered the
+        # backticks on the slide. The audio track was already clean -
+        # `_flatten_parentheses` strips them - so this was a visual-only defect,
+        # which is exactly the kind that survives because nothing checks the
+        # slide text for formatting. Same rule as the title gate.
+        clean = _strip_markdown(dd)
+        if clean != dd:
+            plan["scenes"][i]["design_decision"] = clean
+            stripped += 1
+    return removed + stripped
 def _sanitize_plan_source_leaks(plan: dict,
                                 voice: NarrationVoice | None = None,
                                 source_content: str = "",
@@ -230,6 +255,141 @@ def _normalize_scene_titles(plan: dict) -> int:
             scene["title"] = clipped
             changed += 1
     return changed
+# A title is also the first thing spoken, so an incomplete phrase is worse on
+# the audio track than a short one. These are the words that cannot end a
+# phrase; a title stopping on one of them is a fragment, not a title.
+_TITLE_DANGLING = frozenset({
+    "a", "an", "the", "to", "of", "for", "and", "or", "but", "vs", "vs.",
+    "with", "in", "on", "at", "by", "from", "as", "is", "are", "was",
+    "that", "which", "than", "then", "into", "over", "per", "such", "its",
+})
+
+
+def _title_is_fragment(title: str) -> str:
+    """Why this title reads as a fragment: "dangling", "brackets", or "".
+
+    Not a length check. On `mod03_gates_v012_015` every title was 36-41 chars
+    against a 44 cap, so `clip_title` and `_TITLE_CAP` never fired - the 7B
+    emitted the fragments itself ("... metadata that", "... the canonical
+    pointer to", "Kind = verdict semantics (gate vs"). A character budget cannot
+    catch that, which is why this tests the last word and the bracket balance
+    instead.
+    """
+    value = " ".join(str(title).split())
+    if not value:
+        return ""
+    if value.count("(") != value.count(")") or value.count("[") != value.count("]"):
+        return "brackets"
+    last = value.split()[-1].strip(".,:;—–").casefold()
+    if last in _TITLE_DANGLING:
+        return "dangling"
+    if value.rstrip().endswith(("—", "–", "-", ",", ":", ";")):
+        return "dangling"
+    return ""
+
+
+def _strip_dangling_tail(title: str) -> str:
+    """Drop trailing function words, then any bracket left open by the drop."""
+    parts = " ".join(str(title).split()).split()
+    while parts and parts[-1].strip(".,:;—–").casefold() in _TITLE_DANGLING:
+        parts.pop()
+    value = " ".join(parts).rstrip(" ,:;—–")
+    # Losing the tail can unbalance a bracket; prefer the shorter balanced text
+    # over closing a bracket that never had its partner in view.
+    while value.count("(") > value.count(")"):
+        cut = value.rfind("(")
+        if cut <= 0:
+            break
+        value = value[:cut].rstrip(" ,:;—–")
+    return value
+
+
+def _fix_incomplete_titles(plan: dict) -> int:
+    """Replace fragment titles with the concept name the plan already carries.
+
+    Repair order, most authoritative first:
+      1. the heading of the section the scene was assigned - that is the
+         document's own name for the concept, and it is what the provenance
+         record already points at;
+      2. the scene's `topic`, when it is longer than the fragment and is itself
+         complete;
+      3. the fragment with its dangling tail removed.
+
+    Deliberately not a longer character budget. Raising `_TITLE_CAP` would let
+    the same 7B produce a 60-character fragment instead of a 40-character one.
+    """
+    sections = plan.get("source_sections") or []
+    by_index = {s.get("index"): str(s.get("heading") or "")
+                for s in sections if s.get("heading")}
+    assignment = {a.get("scene"): a for a in plan.get("source_assignment") or []
+                  if a.get("status") == "assigned"}
+    changed = 0
+    for scene_no, sc in enumerate(plan.get("scenes", []), 1):
+        title = str(sc.get("title") or "")
+        if not title or not _title_is_fragment(title):
+            continue
+        topic = str(sc.get("topic") or "").strip()
+        record = assignment.get(scene_no) or {}
+        heading = by_index.get(record.get("section_index")) or str(
+            record.get("heading") or "")
+        # Strip the source heading's own "N." / "### " decoration.
+        for pattern in (r"^#{1,6}\s*", r"^\s*\d+[.)]\s*"):
+            heading = re.sub(pattern, "", heading).strip()
+        stripped = _strip_dangling_tail(title)
+
+        # Keep the deck's existing numbering. `build_tts_script` already strips a
+        # leading "N." from `spoken_title`, so the number is visual only, and
+        # dropping it from a repaired title while its neighbours keep theirs
+        # makes the deck look like it lost a step.
+        prefix = ""
+        got = re.match(r"^\s*(\d+[.):])\s*", title)
+        if got:
+            prefix = got.group(1)
+
+        def _forms(raw: str) -> list[str]:
+            """Every title we could reasonably use, drawn from `raw`."""
+            out: list[str] = []
+            clean = re.sub(r"[`*_]", "", str(raw or ""))
+            clean = " ".join(clean.split()).strip("\"'")
+            if not clean or _title_is_fragment(clean):
+                return out
+            out.append(clip_title(clean))
+            # The source convention is `N. Concept - qualifier`: the concept name
+            # is the head and the qualifier is decoration. A 44-character clip
+            # frequently lands inside the qualifier and leaves a fragment, so
+            # the head is a distinct candidate.
+            head = re.split(r"\s+[—–-]\s+", clean)[0].strip(" ,:;—–")
+            if len(head) >= 8 and not _title_is_fragment(head):
+                out.append(head)
+            seen, uniq = set(), []
+            for value in out:
+                if value and value not in seen:
+                    seen.add(value)
+                    uniq.append(value)
+            return uniq
+
+        # Heading and topic are pooled and scored together, not tried in
+        # sequence. On v012_015 scene 3 the heading is
+        # "Kind = verdict semantics (gate vs guardrail vs info)" - complete, but
+        # 55 characters with no clause separator to fall back on, so no shorter
+        # form of it exists. The topic "Kind = verdict semantics" is both
+        # shorter and complete, and a sequential fallback would never reach it.
+        candidates: list[str] = []
+        for raw in (heading, re.sub(r"^\s*m\d+\s*[-.:]?\s*", "", topic,
+                                    flags=re.IGNORECASE)):
+            candidates.extend(_forms(raw))
+        complete = [c for c in candidates if not _title_is_fragment(c)]
+        replacement = min(complete, key=len) if complete else stripped
+
+        if prefix and replacement and not replacement.startswith(prefix):
+            replacement = f"{prefix} {replacement}"
+        if replacement and replacement != title and not _title_is_fragment(
+                replacement):
+            sc["title"] = replacement
+            changed += 1
+    return changed
+
+
 def _scene_bullet_pages(scene: dict) -> list[list[str]]:
     bullets = [str(value) for value in (scene.get("bullets") or [])]
     if not bullets:
@@ -637,6 +797,83 @@ def _drop_repeated_bullet_clauses(plan: dict) -> int:
     return dropped
 
 
+# A scene that cannot show two teaching points cannot satisfy the A2.13
+# "2+ teaching points" contract that `_has_teaching_claim` enforces, and it
+# fails the pre-audio gate as `tts_required_concept_missing`. v012_014 hit
+# exactly this: the ungrounded gate took scene 7 from 2 bullets to 1, the
+# canned opener was stripped as fridge-chatter, 6 content words remained against
+# a floor of 8, and a 38s build died. v012_015 survived only because the 7B
+# happened to drop 1 bullet instead of 3 and scene 8 landed on exactly 2.
+_MIN_BULLETS_PER_SCENE = 2
+
+
+def _rehydrate_starved_scenes(plan: dict) -> int:
+    """Top every scene under the bullet floor back up from its own source text.
+
+    Returns the number of scenes touched. Safe to run unconditionally and
+    idempotent: a scene already at or above the floor is left alone, and a
+    re-hydrated sentence is checked against the scene's existing bullets so a
+    second pass cannot duplicate it.
+    """
+    touched = 0
+    for scene_no, sc in enumerate(plan.get("scenes", []), 1):
+        bullets = [str(b) for b in (sc.get("bullets") or [])]
+        extra = _rehydrate_bullets_from_source(
+            sc, len(bullets), chunk=verified_source_chunk(plan, scene_no))
+        if extra:
+            sc["bullets"] = bullets + extra
+            touched += 1
+    return touched
+
+
+def _rehydrate_bullets_from_source(sc: dict, have: int,
+                                   floor: int = _MIN_BULLETS_PER_SCENE,
+                                   chunk: str | None = None) -> list[str]:
+    """Top a starved scene back up to `floor` bullets from its own source text.
+
+    Deliberately NOT a floor that keeps the ungrounded bullets. Two alternatives
+    were measured and both are worse:
+
+    - Retaining the ungrounded bullets satisfies the count but re-breaks the
+      hard grounding gate this function exists to satisfy, so the build spends
+      an LLM call and may fail anyway.
+    - Dropping the narration sentences derived from dropped text (the obvious
+      companion fix) makes this case *worse*: on v012_014 scene 7 it would leave
+      only the canned opener, i.e. 0 content words against a floor of 8.
+
+    `source_chunk` is real source prose, so anything derived from it is anchored
+    by construction - which is exactly what the dropped bullet was not. Every
+    scene carries one (`_annotate_source_chunks` attaches it to 9/9 scenes on
+    both v012_014 and v012_015), so the material is always there; the model just
+    did not use it.
+    """
+    need = floor - have
+    if need <= 0:
+        return []
+    if chunk is None:
+        chunk = sc.get("source_chunk")
+    if not isinstance(chunk, str) or not chunk.strip():
+        return []
+    existing = {str(b).strip().casefold() for b in (sc.get("bullets") or [])}
+    out: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", chunk.strip()):
+        # Source prose carries markdown that must not reach a spoken track: a
+        # leading "- " made the rebuilt narration open with a dash, and "1."
+        # enumerators read as list numbers rather than teaching content.
+        text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", sentence)
+        text = re.sub(r"[*`_]+", "", text).strip()
+        # A bullet is a spoken teaching point: one clause, bounded length.
+        if not (12 <= len(text) <= 120):
+            continue
+        if text.casefold() in existing:
+            continue
+        existing.add(text.casefold())
+        out.append(text)
+        if len(out) >= need:
+            break
+    return out
+
+
 def _drop_ungrounded_slide_text(plan: dict,
                                 source_bigrams: set[tuple[str, str]],
                                 source_tokens: set[str]) -> int:
@@ -675,21 +912,43 @@ def _drop_ungrounded_slide_text(plan: dict,
         return clip_title(value)
 
     dropped = 0
-    for sc in plan.get("scenes", []):
+    # Record what was removed, and where. Without this the dropped text exists
+    # nowhere: the log carries a count and the plan is written after the drop, so
+    # the artifact cannot be used to ask whether the narration still speaks about
+    # something the slide no longer shows. See LLD 22.13.
+    removed: list[dict] = []
+
+    def _note(scene_index: int, field: str, text: str) -> None:
+        removed.append({"scene": scene_index, "field": field,
+                        "text": str(text)[:200]})
+
+    for index, sc in enumerate(plan.get("scenes", []), 1):
         for field in ("bullets", "takeaways"):
             items = [str(x) for x in (sc.get(field) or [])]
-            kept = [x for x in items if _anchored(x)]
+            # Decide per index, not by membership: `x not in kept` is wrong when
+            # the same text appears twice and one copy survives, so the count
+            # said 4 dropped while the record held 2.
+            verdicts = [_anchored(x) for x in items]
+            kept = [x for x, ok in zip(items, verdicts, strict=True) if ok]
+            for gone in (x for x, ok in zip(items, verdicts, strict=True) if not ok):
+                _note(index, field, gone)
             dropped += len(items) - len(kept)
             sc[field] = kept
         for field in ("visual_diagram", "code_snippet"):
             val = str(sc.get(field, "")).strip()
             if val and not _anchored(val):
+                _note(index, field, val)
                 sc[field] = ""
                 dropped += 1
     plan_tk = [str(t) for t in (plan.get("takeaways") or [])]
     kept_tk = [t for t in plan_tk if _anchored(t)]
+    for gone, ok in ((t, _anchored(t)) for t in plan_tk):
+        if not ok:
+            _note(0, "plan_takeaways", gone)
     dropped += len(plan_tk) - len(kept_tk)
     plan["takeaways"] = kept_tk
+    if removed:
+        plan["dropped_slide_text"] = removed
     used_titles = {str(sc.get("title", "")).strip().casefold()
                    for sc in plan.get("scenes", [])}
     for sc in plan.get("scenes", []):
@@ -1125,13 +1384,6 @@ _CHUNK_W_BULLETS = 0.20
 # hydrating it from an unrelated part of the document.
 _CHUNK_MIN_CONFIDENCE = 0.18
 
-def _text_digest(text: str) -> str:
-    """Short content digest of a source section, for provenance."""
-    import hashlib
-
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
 def _scene_chunk_weights(scene: dict) -> dict[str, float]:
     """Per-field weighted anchor tokens for source-chunk matching.
 
@@ -1251,13 +1503,82 @@ def _annotate_source_chunks(plan: dict, content: str) -> int:
         records.append({
             "scene": si + 1, "status": "assigned", "heading": head,
             "score": round(score, 4),
+            # The chunk's own digest, not just the section's. `section_digest`
+            # proves which section was assigned, but every repair path reads
+            # `source_chunk`, and that is a mutable plan field: nothing verified
+            # it still came from the section the record names. A re-assignment
+            # that moved the scene without rewriting the chunk would feed the
+            # wrong section's prose straight into the narration, silently.
+            "chunk_digest": _text_digest(chunk),
             "section_index": i,
             # A content digest, not the heading string: the heading is display
             # metadata and can be duplicated or edited after the fact.
             "section_digest": _text_digest(f"{head}\n{sections[i][1]}"),
         })
     plan["source_assignment"] = records
+    # Persist the whole skeleton, not just the claimed parts. Coverage is the
+    # only question you cannot answer from `source_assignment` alone, because
+    # that list records what was taken, never what was left. Without this the
+    # document half of "did the lesson cover the doc" is unanswerable offline,
+    # which is why nothing flagged concepts 4/10/11/12 going unused.
+    plan["source_sections"] = [
+        {"index": i,
+         "heading": head.lstrip("#").strip(),
+         "digest": _text_digest(f"{head}\n{body}")}
+        for i, (head, body) in enumerate(sections)
+    ]
     return annotated
+
+# A section is worth a scene if it names a teachable concept. These headings are
+# navigation or a sign-off, not material: turning "Now read the LLD" into a
+# scene would pad the deck and teach nothing.
+_COVERAGE_SKIP = (
+    "one sentence to memorize", "now read", "checkpoints", "you know you understood",
+    "table of contents", "further reading", "references", "glossary", "prereq",
+)
+def _is_coverable_section(heading: str) -> bool:
+    low = heading.strip().lower()
+    if not low or len(low) < 4:
+        return False
+    return not any(k in low for k in _COVERAGE_SKIP)
+
+
+def _unclaimed_source_sections(plan: dict) -> list[dict]:
+    """Source sections that no scene claimed, by the assignment's own record.
+
+    `_topic_coverage_problem` asks whether the lesson touches the docs' core
+    *terms*. That is a vocabulary test, and it passes happily while a whole
+    concept goes untaught, because a skipped concept's words still turn up in
+    passing. Structure is what goes missing, and nothing measured it: on
+    `mod03_gates_v012_013`, concepts 4, 10, 11 and 12 were used by no scene and
+    nothing in the pipeline said so.
+
+    Deliberately claim-based, with no token-overlap fallback. A section can in
+    principle be taught by a scene whose best match landed on a neighbour, so
+    overlap looks like the safe second test - measured, it is not. Concept 4
+    ("Tolerance and the two units") scores 0.70 overlap against scene text on
+    the strength of the single word "tolerance", and 0.75 after dropping every
+    token that appears in more than half the scenes. Overlap cannot tell
+    "mentions the word" from "teaches the concept", so reporting it would
+    manufacture false negatives on exactly the borderline cases worth seeing.
+    The claim record is exact, so this reports only what it can prove and says
+    so in the finding text.
+    """
+    sections = plan.get("source_sections") or []
+    if not sections:
+        return []
+    numbered = [s for s in sections
+                if re.match(r"^\d+[.)]\s", s.get("heading", ""))]
+    # Prefer the doc's own numbered concept list when it has one: it is the
+    # strongest available statement of which sections are the things to teach.
+    pool = numbered if len(numbered) >= 3 else [
+        s for s in sections if _is_coverable_section(s.get("heading", ""))]
+    claimed = {r.get("section_index") for r in plan.get("source_assignment") or []
+               if r.get("status") == "assigned"
+               and isinstance(r.get("section_index"), int)}
+    return [s for s in pool
+            if s.get("index") not in claimed and s.get("heading")]
+
 
 def _dedupe_visual_diagrams(plan: dict) -> int:
     """Drop a diagram that repeats one an earlier scene already showed.
@@ -1749,6 +2070,7 @@ def plan_lesson(content: str, target_minutes: float,
               end="", flush=True)
     _harvest_takeaways(plan)
     fixed = _fix_placeholder_titles(plan)
+    _fix_incomplete_titles(plan)
     if fixed:
         print(f"\n  [1/5] retitled {fixed} placeholder scene title(s).",
               end="", flush=True)
@@ -1798,6 +2120,30 @@ def plan_lesson(content: str, target_minutes: float,
                                                      topics)
     ungrounded_dropped = _drop_ungrounded_slide_text(plan, source_bigrams,
                                                      source_tokens)
+    # The ungrounded drop runs LAST in the repair chain, so `_repair_thin_
+    # narrations` - which reads `source_chunk` and raises its floor when one is
+    # present - has already run and never sees a scene the drop then starved.
+    # On v012_014 that is the whole failure: scene 7 lost a bullet, its
+    # narration was left 6 content words against a floor of 8, and the
+    # pre-audio gate killed a 38s build. Re-run the two idempotent repairs so
+    # they see the final state. Both only act on scenes that currently fail.
+    # The ungrounded drop runs LAST in the repair chain, so `_repair_thin_
+    # narrations` - which reads `source_chunk` and raises its floor when one is
+    # present - has already run and never sees a scene the drop then starved.
+    # On v012_014 that is the whole failure: scene 7 lost a bullet, its
+    # narration was left 6 content words against a floor of 8, and the
+    # pre-audio gate killed a 38s build.
+    #
+    # Unconditional, not gated on `ungrounded_dropped`: a plan loaded from disk
+    # is already post-drop, so the drop is a no-op on replay and a gated pass
+    # would never run - the starvation is persisted in the artifact and only
+    # `verify` can still see it.
+    rehydrated = _rehydrate_starved_scenes(plan)
+    if rehydrated or ungrounded_dropped:
+        # Narration last: the rebuild reads the scene's own bullets, so it must
+        # follow the top-up or it rebuilds from the starved set.
+        _enforce_unique_narration_trigrams(plan, quiet=True, protected=protected)
+        _repair_thin_narrations(plan, voice=voice, protected=protected)
     if ungrounded_dropped:
         print(f"\n  [1/5] dropped {ungrounded_dropped} ungrounded slide text "
               f"item(s) (no source anchor).", end="", flush=True)

@@ -104,3 +104,54 @@ def _load_pptx(p: Path, max_chars: int) -> str:
     if not joined.strip():
         raise ValueError(f"No slide text found in {p}")
     return joined[:max_chars]
+
+
+def _text_digest(text: str) -> str:
+    """Short content digest of a source section, for provenance.
+
+    Lives here rather than in `plan.py` because `plan` imports `narration`, so
+    anything provenance-related that the narration repair also needs would be
+    unreachable from there. `hashlib` was already imported for `file_digest`.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def verified_source_chunk(plan: dict, scene_no: int) -> str:
+    """The scene's `source_chunk`, but only if it still matches the record.
+
+    Defect 2d. Every deterministic repair that hydrates from source - the
+    thin-narration rebuild and the starved-scene bullet top-up - reads
+    `sc["source_chunk"]` directly. That field is mutable and unverified, so a
+    plan whose assignment moved on while the chunk did not would feed another
+    section's prose straight into the audio: no finding, no log line, and a
+    narration that is grounded in the wrong paragraph.
+
+    `section_digest` proves which section was assigned but cannot be recomputed
+    from the chunk, so assignment records also carry `chunk_digest` - a digest of
+    the chunk itself, written at the same moment.
+
+    Returns "" when there is no record or the digest disagrees, so callers fall
+    back to their existing behaviour instead of trusting a chunk they cannot
+    vouch for. A plan written before `chunk_digest` existed is passed through
+    unverified rather than rejected: the field is absent, not wrong, and
+    refusing it would invalidate every artifact already on disk.
+    """
+    scenes = plan.get("scenes") or []
+    if not (1 <= scene_no <= len(scenes)):
+        return ""
+    chunk = str(scenes[scene_no - 1].get("source_chunk") or "").strip()
+    if not chunk:
+        return ""
+    record = next((a for a in (plan.get("source_assignment") or [])
+                   if a.get("scene") == scene_no), None)
+    if not record:
+        # No record is not the same as a contradicted one. There is nothing for
+        # the chunk to disagree with, and refusing it would break legitimate
+        # plans - a hand-built scene, or one predating source assignment
+        # entirely. The defect this guards is a MISMATCH, and that is caught
+        # below. An existing test caught the over-strict version.
+        return chunk
+    recorded = record.get("chunk_digest")
+    if not recorded:
+        return chunk
+    return chunk if _text_digest(chunk) == recorded else ""

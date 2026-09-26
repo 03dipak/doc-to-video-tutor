@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -59,6 +58,147 @@ async def _scene_audio(text: str, out_path: Path, voice: str,
     return timings
 
 
+# Real loudness readings, harvested from the loudnorm pass the build already
+# runs and previously discarded. The build printed `LOUDNESS_TARGET` /
+# `LOUDNESS_TP` - the configured constants - under a "loudness :" label, so the
+# log reported a target as though it were a measurement. A reviewer checking the
+# artifacts against the log found the true peak was -1.8 dBTP against a printed
+# -1.5. Same collector shape as `slides.LAYOUT_NOTES` for the same reason: a
+# value computed during the build and thrown away has to be computed again by
+# whoever reviews it, and reviewers get expensive.
+LOUDNESS_MEASURED: list[dict] = []
+
+
+_EBU_I = re.compile(r"\bI:\s*(-?[0-9.]+|-inf)\s*LUFS")
+_EBU_PEAK = re.compile(r"\bPeak:\s*(-?[0-9.]+|-inf)\s*dBFS")
+
+
+def _ebur128(path: Path, mono: bool = False) -> dict:
+    """Integrated loudness and true peak of a finished file, via one ffmpeg pass.
+
+    Measured, never configured. The build used to print `LOUDNESS_TARGET` under
+    a "loudness :" label, and a reviewer then reported a mono-downmix failure at
+    -19.7 LUFS that does not reproduce by any of the three methods here
+    (ebur128 -ac 1, ebur128 stereo, loudnorm's own summary all read ~-16.7).
+    Recording the reading is what settles that class of disagreement: a number
+    you can re-derive beats a number someone asserts.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not path.exists():
+        return {}
+    # -vn matters: without it ffmpeg decodes 7904 frames of 720p to measure
+    # audio, which measured 11.2s against 4.6s for the same reading. A build
+    # that pays that on every run will get the check skipped.
+    cmd = [ffmpeg, "-hide_banner", "-nostats", "-vn", "-i", str(path),
+           "-af", "ebur128=peak=true"]
+    if mono:
+        cmd += ["-ac", "1"]
+    cmd += ["-f", "null", "-"]
+    try:
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    got: dict = {}
+    hits = _EBU_I.findall(run.stderr)
+    if hits and hits[-1] not in ("-inf", ""):
+        with contextlib.suppress(ValueError):
+            got["integrated_lufs"] = float(hits[-1])
+    peaks = _EBU_PEAK.findall(run.stderr)
+    if peaks and peaks[-1] not in ("-inf", ""):
+        with contextlib.suppress(ValueError):
+            got["true_peak_dbfs"] = float(peaks[-1])
+    return got
+
+
+def measure_delivery(out_base: Path) -> dict:
+    """Everything a reviewer would otherwise have to re-measure by hand.
+
+    Container facts plus the delivered audio's loudness in both the delivered
+    stereo form and downmixed to mono. The mono figure is the one that catches
+    a channel-summation illusion: BS.1770 sums identical L/R with +3 dB, so a
+    file can measure compliant in stereo and fail once a QC pass downmixes it.
+    It passes today (-16.7 both ways) - recorded so that stays checkable.
+    """
+    import json as _json
+    out: dict = {}
+    mp4 = Path(f"{out_base}.mp4")
+    probe = shutil.which("ffprobe")
+    if probe and mp4.exists():
+        cmd = [probe, "-v", "error", "-show_entries",
+               "format=duration,bit_rate", "-show_entries",
+               "stream=codec_type,width,height,r_frame_rate,bit_rate,channels",
+               "-of", "json", str(mp4)]
+        try:
+            run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            data = _json.loads(run.stdout or "{}")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            data = {}
+        fmt = data.get("format") or {}
+        if fmt.get("duration"):
+            with contextlib.suppress(ValueError):
+                out["seconds"] = round(float(fmt["duration"]), 3)
+        if fmt.get("bit_rate"):
+            with contextlib.suppress(ValueError):
+                out["total_bps"] = int(fmt["bit_rate"])
+        for s in data.get("streams") or []:
+            if s.get("codec_type") == "video":
+                out["width"], out["height"] = s.get("width"), s.get("height")
+                out["fps"] = s.get("r_frame_rate")
+                if s.get("bit_rate"):
+                    with contextlib.suppress(ValueError):
+                        out["video_bps"] = int(s["bit_rate"])
+            elif s.get("codec_type") == "audio":
+                out["audio_channels"] = s.get("channels")
+                if s.get("bit_rate"):
+                    with contextlib.suppress(ValueError):
+                        out["audio_bps"] = int(s["bit_rate"])
+    if mp4.exists():
+        stereo = _ebur128(mp4)
+        if stereo:
+            out["loudness"] = stereo
+        mono = _ebur128(mp4, mono=True)
+        if mono:
+            out["loudness_mono_downmix"] = mono
+    clips = []
+    for c in sorted(Path(f"{out_base}_audio").glob("*.mp3")):
+        entry = {"clip": c.name, "bytes": c.stat().st_size}
+        clips.append(entry)
+    if clips:
+        out["clips"] = len(clips)
+        out["loudness_target_lufs"] = LOUDNESS_TARGET
+        out["loudness_target_dbtp"] = LOUDNESS_TP
+        measured = [m for m in LOUDNESS_MEASURED if "integrated_lufs" in m]
+        if measured:
+            out["clip_lufs_range"] = [min(m["integrated_lufs"] for m in measured),
+                                       max(m["integrated_lufs"] for m in measured)]
+            out["clip_true_peak_dbtp"] = max(
+                m["true_peak_dbtp"] for m in measured if "true_peak_dbtp" in m)
+    return out
+
+
+def _parse_loudnorm(stderr: str) -> dict:
+    """Pull the loudness readings out of ffmpeg's loudnorm summary.
+
+    "Output Integrated" / "Output True Peak" are what the normalised file now
+    contains, i.e. the delivered loudness; "Input *" is what the TTS provider
+    produced. Report the output, keep the input so a reviewer can see the gain
+    that was applied. Split out as a pure function so it can be pinned without
+    ffmpeg, a network call, or a real clip.
+    """
+    fields = (("integrated_lufs", "Output Integrated"),
+              ("true_peak_dbtp", "Output True Peak"),
+              ("in_integrated_lufs", "Input Integrated"),
+              ("in_true_peak_dbtp", "Input True Peak"),
+              ("lra_lu", "Input LRA"))
+    out: dict = {}
+    for line in stderr.splitlines():
+        for key, field in fields:
+            if field in line:
+                with contextlib.suppress(IndexError, ValueError):
+                    out[key] = float(line.split(":")[1].split()[0])
+    return out
+
+
 def _normalize_loudness(path: Path) -> bool:
     """One-pass EBU R128 loudness normalization (rule C3) via ffmpeg loudnorm.
 
@@ -78,8 +218,12 @@ def _normalize_loudness(path: Path) -> bool:
         run = subprocess.run(
             [ffmpeg, "-y",
              "-i", str(path),
+             # print_format=summary is what makes loudnorm report what it
+             # measured. Without it the filter chain normalises silently and
+             # the numbers the log used to print were the config constants.
              "-af", (f"loudnorm=I={LOUDNESS_TARGET}:TP={LOUDNESS_TP}:"
-                     f"LRA={LOUDNESS_LRA},alimiter=limit={peak_limit:.6f}:"
+                     f"LRA={LOUDNESS_LRA}:print_format=summary,"
+                     f"alimiter=limit={peak_limit:.6f}:"
                      "attack=5:release=50:level=disabled"),
              "-ac", "1", "-ar", "44100",
              "-codec:a", "libmp3lame", "-q:a", "2",
@@ -89,7 +233,16 @@ def _normalize_loudness(path: Path) -> bool:
             print(f"  WARN: loudnorm failed for {path.name}; keeping original "
                   f"({run.stderr.strip().splitlines()[-1:]})")
             return False
-        os.replace(tmp, path)
+        # loudnorm reports what it measured on the way through. Keep it.
+        measured = _parse_loudnorm(run.stderr)
+        if measured:
+            LOUDNESS_MEASURED.append({"clip": path.name, **measured})
+        # `os.replace` is rename(2): it cannot cross a filesystem boundary and
+        # fails EXDEV. The build's work dir and TMPDIR are usually the same
+        # device so this stayed hidden, but with the output dir elsewhere every
+        # clip silently skipped normalisation and shipped at edge-tts' own
+        # level. `shutil.move` falls back to copy+unlink.
+        shutil.move(str(tmp), str(path))
         return True
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"  WARN: loudnorm skipped for {path.name}: {exc}")
@@ -259,6 +412,11 @@ def _variant_durations(scene_dur: float, variant_count: int,
 
 def synth_scenes(script: dict, work_dir: Path, voice: str | None
                  ) -> tuple[list[Path], list[list[dict]]]:
+    # Cleared per run, mirroring `slides.render_scenes` clearing `LAYOUT_NOTES`.
+    # Without this a second build in the same process inherits the first run's
+    # clip measurements, and the summary below would report the union of two
+    # builds' loudness as though it were one.
+    del LOUDNESS_MEASURED[:]
     clips = script.get("clips", [])
     p = _Progress("TTS", len(clips))
     texts = [str(c["spoken"]) for c in clips]
@@ -282,8 +440,24 @@ def synth_scenes(script: dict, work_dir: Path, voice: str | None
         p._tick(i)
     p.done()
     if TTS_LOUDNORM != "off":
-        print(f"  loudness : {LOUDNESS_TARGET} LUFS / {LOUDNESS_TP} dBTP "
-              f"({normalized}/{len(paths)} clips via ffmpeg loudnorm)")
+        # Target and measurement, labelled as such. These are different claims
+        # and printing one under the other's label is how -1.8 dBTP shipped as
+        # "-1.5 dBTP" in every build log so far.
+        if LOUDNESS_MEASURED:
+            lufs = [m["integrated_lufs"] for m in LOUDNESS_MEASURED
+                    if "integrated_lufs" in m]
+            peaks = [m["true_peak_dbtp"] for m in LOUDNESS_MEASURED
+                     if "true_peak_dbtp" in m]
+            span = (f"{min(lufs):.1f}..{max(lufs):.1f} LUFS" if lufs
+                    else "unmeasured")
+            pk = (f"{max(peaks):.1f} dBTP" if peaks else "unmeasured")
+            print(f"  loudness : measured {span} / {pk} true peak "
+                  f"(target {LOUDNESS_TARGET} LUFS / {LOUDNESS_TP} dBTP, "
+                  f"{normalized}/{len(paths)} clips via ffmpeg loudnorm)")
+        else:
+            print(f"  loudness : target {LOUDNESS_TARGET} LUFS / "
+                  f"{LOUDNESS_TP} dBTP, MEASUREMENT UNAVAILABLE "
+                  f"({normalized}/{len(paths)} clips normalized)")
     if dead:
         print(f"  WARN: {len(dead)} clip(s) look truncated or silent: "
               f"{', '.join(dead[:4])}")
@@ -419,7 +593,7 @@ _VTT_BREAKS = ".!?।"   # end a cue at sentence punctuation
 def _write_webvtt(out_base: Path, script: dict,
                   timings: Sequence[Sequence[dict] | None],
                   audios: Sequence[Path] | None = None,
-                  pause: float = 3.0) -> int:
+                  pause: float = 3.0, lead_in: float = 0.0) -> int:
     """Write a WebVTT caption track from the provider's own word stream.
 
     `edge_tts.SubMaker` builds cues from the very same `WordBoundary` events that
@@ -440,7 +614,14 @@ def _write_webvtt(out_base: Path, script: dict,
         return 0
     maker = edge_tts.SubMaker()
     fed = 0
-    base_s = 0.0
+    # `lead_in` is the silent title card the video prepends before clip 1. The
+    # caption track is for a human watching the MP4, so it must be on the video's
+    # timeline, not the audio's. Measured on v012_015: every cue fired 7.000s
+    # early - TITLE_HOLD (4.0) plus the inter-clip pause (3.0) - because
+    # `base_s` started at 0 while the renderer started the first clip at 7.0.
+    # The VTT is written before that prepend happens, so the offset cannot be
+    # inferred here and has to be passed in.
+    base_s = lead_in
     try:
         for position, words in enumerate(timings):
             if not words:
@@ -614,7 +795,10 @@ def _render_media(plan: dict, out_base: Path, script: dict, voice: str | None,
     spoken_words = sum(len(entry["words"]) for entry in word_timings["clips"])
     print(f"  word sync  : {spoken_words} word timings captured "
           f"-> {out_base}.word_timings.json")
-    vtt_cues = _write_webvtt(out_base, script, timings, audios)
+    # Only the rendered video carries the title card; with --skip-video there is
+    # no lead-in and clip 1 genuinely starts at 0.
+    vtt_cues = _write_webvtt(out_base, script, timings, audios, pause=pause,
+                             lead_in=0.0 if skip_video else TITLE_HOLD + pause)
     if vtt_cues:
         print(f"  captions   : {vtt_cues} cues -> {out_base}.vtt")
     audio_dir = Path(f"{out_base}_audio")

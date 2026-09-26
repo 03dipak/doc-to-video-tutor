@@ -19,6 +19,7 @@ from .plan import (
     _repeated_bullets,
     _scene_count_problem,
     _section_problems,
+    _unclaimed_source_sections,
 )
 from .speech import contains_corrupt_text, spoken_token_set
 from .text import (
@@ -176,6 +177,61 @@ def _narration_has_content(nar: str, title: str) -> bool:
     content = [w for w in tokens
                if w not in title_words and w not in _TRANSITION_FILLER]
     return len(content) >= 3 and len(content) / len(tokens) >= 0.4
+def _narration_references_dropped_text(plan: dict) -> list[str]:
+    """Narration that still speaks about slide text the grounding gate removed.
+
+    `_drop_ungrounded_slide_text` runs *after* the narration pass and all
+    narration repair, so it can remove a bullet the narration was written around.
+    The narrator then speaks about something the viewer cannot see. Nothing
+    re-validates the narration against the post-drop slide, and the removed text
+    used to survive nowhere at all - the log carried a count and the plan was
+    written after the drop - so the question could not even be asked of an
+    artifact. The drop now records what it removed, which makes this check
+    possible.
+
+    Matching is on canonical 4-grams from the same tokenizer the repeat rules
+    use. A shared 4-gram is a deliberate signal: the removed text was ungrounded
+    filler, so the only way for four consecutive content words of it to appear in
+    the narration is that the narrator was given that text. Loose token overlap
+    would fire on ordinary connective phrasing and cry wolf.
+
+    Soft, not hard: the remedy is a narration decision, and silently rewriting
+    the script to match a pruned slide is content injection.
+    """
+    removed = plan.get("dropped_slide_text") or []
+    if not removed:
+        return []
+    findings: list[str] = []
+    scenes = plan.get("scenes", [])
+    for entry in removed:
+        try:
+            index = int(entry.get("scene", 0))
+        except (TypeError, ValueError):
+            continue
+        gone = _nar_tokens(str(entry.get("text", "")))
+        if len(gone) < 4:
+            continue
+        # scene 0 means a plan-level takeaway; check every scene.
+        targets = ([scenes[index - 1]] if 1 <= index <= len(scenes) else scenes)
+        for scene in targets:
+            spoken = _nar_tokens(str((scene or {}).get("narration", "")))
+            grams = {tuple(spoken[k:k + 4]) for k in range(len(spoken) - 3)}
+            shared = [tuple(gone[k:k + 4]) for k in range(len(gone) - 3)
+                      if tuple(gone[k:k + 4]) in grams]
+            if shared:
+                where = f"scene {index}" if index else "the narration"
+                findings.append(soft_finding(
+                    f"{where} still speaks about {entry.get('field')} text the "
+                    f"grounding gate removed ({' '.join(shared[0])!r}); the "
+                    f"viewer hears about something the slide no longer shows",
+                    # Must match the registered prefix, or the soft/hard split
+                    # counts this as hard and the sample loop resamples the whole
+                    # plan to satisfy a check the model was never asked about.
+                    prefix="narration still speaks about"))
+                break
+    return findings
+
+
 def check_audit_binding(plan_path: Path, audit_path: Path) -> list[str]:
     """Verify an audit artifact describes the plan sitting beside it.
 
@@ -210,6 +266,32 @@ def check_audit_binding(plan_path: Path, audit_path: Path) -> list[str]:
     return findings
 
 
+def _source_coverage_gaps(plan: dict) -> list[str]:
+    """Report source sections that no scene claimed.
+
+    The enrichment lever this exposes is coverage, not invention: on
+    `mod03_gates_v012_013` four numbered concepts were used by no scene, and the
+    only coverage check in the pipeline - `_topic_coverage_problem` - is a
+    vocabulary test that cannot see them, because a skipped concept's words
+    still appear in passing elsewhere.
+
+    Soft, and worded to claim exactly what it proves. An unclaimed section may
+    still be taught by a scene whose best match landed on a neighbour, so this
+    names the sections as something to confirm, not as missing content.
+    """
+    sections = _unclaimed_source_sections(plan)
+    if not sections:
+        return []
+    shown = "; ".join(s["heading"][:60] for s in sections[:4])
+    if len(sections) > 4:
+        shown += f"; +{len(sections) - 4} more"
+    return [soft_finding(
+        f"{len(sections)} of the source's concept sections were not assigned "
+        f"to any scene ({shown}); the lesson cannot be teaching what it never "
+        f"drew on - confirm each, then cover the real ones",
+        prefix="source section not covered")]
+
+
 def soft_finding(detail: str, prefix: str = "unspoken visual claim") -> str:
     """Format a finding so the soft/hard filter can actually see it.
 
@@ -222,6 +304,12 @@ def soft_finding(detail: str, prefix: str = "unspoken visual claim") -> str:
     the contract hold by construction rather than by remembering a convention.
     """
     return f"{prefix}: {detail}"
+
+
+# Share of a design-decision card's content words the narration must carry.
+# Prose, so it is a coverage test rather than a token hit; 0.6 is where a
+# paraphrased-but-taught decision still passes and a deleted sentence does not.
+_DESIGN_DECISION_SPOKEN_FRACTION = 0.6
 
 
 def _unspoken_visual_claims(plan: dict,
@@ -266,6 +354,27 @@ def _unspoken_visual_claims(plan: dict,
             for key in _json_keys(snippet):
                 if not (spoken_token_set(key, rules) & spoken):
                     unspoken.append(key)
+        # `design_decision` is the "Why THIS (not the alternative)" card, and it
+        # is prose, so the token-intersection test used for badges is far too
+        # lenient - one shared word would read as spoken. Require most of its
+        # content words instead.
+        #
+        # Added because the detector structurally could not see the largest
+        # instance of its own defect class: the repeat repair deletes the
+        # design-decision sentence from the narration to kill a duplicated
+        # trigram, and on v012_015 that left 5 of 9 slides showing a claim the
+        # narration no longer made - 373 -> 314 words, -15.8%. Neither
+        # `status_badges` nor `json_snippet` covers this field, so the
+        # divergence was completely silent.
+        decision = str(scene.get("design_decision") or "").strip()
+        if decision:
+            want = spoken_token_set(decision, rules)
+            if want:
+                have = want & spoken
+                coverage = len(have) / len(want)
+                if coverage < _DESIGN_DECISION_SPOKEN_FRACTION:
+                    unspoken.append(
+                        f"design decision ({coverage:.0%} of its words spoken)")
         if unspoken:
             # The message MUST lead with the registered soft prefix. The
             # review-before-build sample loop separates hard from soft by
@@ -350,6 +459,8 @@ def guard_plan(plan: dict, topics: list[str],
     problems += _scene_metadata_problems(plan)
     problems += _slide_text_language_problems(plan)
     problems += _unspoken_visual_claims(plan, voice)
+    problems += _narration_references_dropped_text(plan)
+    problems += _source_coverage_gaps(plan)
     if _opening_template_hit(plan):
         problems.append("opening reuses prompt example sentence")
     if source_top:

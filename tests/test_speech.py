@@ -60,7 +60,11 @@ def test_speech_expand_longest_first_and_boundary() -> None:
     out = S.speech_expand(
         "M1 Data & testset, Active.json, plan.json, Gate = hard fail, "
         "1/(n+1) loop, rasm1", rules)
-    assert "module one Data  and  testset" in out
+    # Whitespace-normalised: the subject here is longest-match-first ordering and
+    # the word boundary below, not the incidental double space left by padded
+    # replacements. `_speak_math_symbols` now collapses runs of spaces, so
+    # pinning the exact spacing would fail on formatting rather than behaviour.
+    assert "module one Data and testset" in " ".join(out.split())
     assert "active dot json" in out
     assert "plan dot json" in out
     assert "equals" in out

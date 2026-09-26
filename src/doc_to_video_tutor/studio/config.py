@@ -268,7 +268,9 @@ _SOFT_PREFIXES = ("narration pure-English",
                    "near-duplicate bullets vs takeaways",
                    "placeholder title restates section",
                    "fused slide token",
-                   "unspoken visual claim")
+                   "unspoken visual claim",
+                   "narration still speaks about",
+                   "source section not covered")
 PACKAGE_NAME = "doc-to-video-tutor"
 PACKAGE_VERSION = "0.1.0"
 BRAND_NAME = PACKAGE_NAME
